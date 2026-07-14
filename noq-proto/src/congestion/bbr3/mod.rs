@@ -2357,4 +2357,145 @@ mod test {
             drain_round_samples.len()
         );
     }
+
+    /// A.5 — Exiting PROBE_UP on a bandwidth plateau.
+    /// equivalent to BBRIsTimeToGoDown:
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.6-6>
+    ///
+    /// Same infinite-buffer, single-bottleneck simulator as A.1/A.3 (constant
+    /// bandwidth `BW`, constant propagation `RTT`, no loss), driven through
+    /// STARTUP -> DRAIN -> PROBE_BW and kept running until PROBE_BW cycles into
+    /// its PROBE_UP phase. In PROBE_UP `pacing_gain` is `ProbeBwUpPacingGain`
+    /// (1.25), so the sender pushes above the link rate and a standing queue
+    /// forms at the bottleneck. `inflight_longterm`/`cwnd` grow to fully utilize
+    /// that queue with no loss, but the measured delivery rate is pinned at `BW`
+    /// and plateaus.
+    ///
+    /// Asserts that once the delivery rate grows by <25% for 3 consecutive rounds
+    /// (`check_full_bw_reached` drives `full_bw_count` to `MAX_FULL_BW_COUNT` and
+    /// sets `full_bw_now`), `BBRIsTimeToGoDown()` (`maybe_go_down`) fires and the
+    /// flow transitions PROBE_UP -> PROBE_DOWN. On the deciding round-start ack
+    /// `is_cwnd_limited` has just been cleared by `start_round`, so the "keep
+    /// probing" branch of `maybe_go_down` is skipped and the plateau drives the
+    /// exit.
+    #[test]
+    fn probe_bw_exits_probe_up_to_probe_down_on_bandwidth_plateau() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated bottleneck bandwidth: 100 Mbit/s in bytes/sec
+        const BW: f64 = 12_500_000.0;
+        /// simulated propagation round-trip time (100ms), matching A.1/A.3
+        const RTT_NS: u64 = 100_000_000;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+
+        // bottleneck serialization time for one MSS-sized packet
+        let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
+
+        // Drive the production default configuration.
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            ack_ns: u64,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        // time at which the bottleneck finishes serving everything queued so far
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // Whether the flow has reached the PROBE_UP phase of PROBE_BW; the go-down
+        // edge we care about is PROBE_UP -> PROBE_DOWN, distinct from the initial
+        // DRAIN -> PROBE_BW(DOWN) entry.
+        let mut reached_probe_up = false;
+        // Captured on the PROBE_UP -> PROBE_DOWN edge: (state, full_bw_count,
+        // full_bw_now). start_probe_bw_down leaves full_bw_count/full_bw_now
+        // untouched, so they still read the plateau values right after the edge.
+        let mut go_down_transition: Option<(BbrState, u64, bool)> = None;
+
+        for _ in 0..1_000_000 {
+            let cwnd = bbr.window();
+            let can_send = inflight + MSS <= cwnd;
+            let next_ack = flight.front().map(|p| p.ack_ns);
+
+            // The sender always has data; send whenever the window allows and a
+            // send is due no later than the next ack, otherwise process an ack.
+            let do_send = can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                now_ns = now_ns.max(next_send_ns);
+                let send_ns = now_ns;
+                // enqueue at the FIFO bottleneck, served at BW
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let ack_ns = finish + RET_NS;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                });
+
+                // pace the next send at BBR's chosen pacing rate; in PROBE_UP this
+                // is BW * 1.25, so the flow overshoots and builds a queue.
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.ack_ns);
+                inflight -= MSS;
+                rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
+                bbr.on_end_acks(at(now_ns), inflight, false, Some(p.pn));
+
+                if bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Up) {
+                    reached_probe_up = true;
+                }
+
+                // Capture the PROBE_UP -> PROBE_DOWN edge (only meaningful once
+                // PROBE_UP has actually been entered).
+                if reached_probe_up
+                    && bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Down)
+                {
+                    go_down_transition =
+                        Some((bbr.state, bbr.full_bw_count, bbr.full_bw_now));
+                    break;
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        // Landed on the PROBE_UP -> PROBE_DOWN edge.
+        assert!(reached_probe_up, "BBR never reached the PROBE_UP phase");
+        let (state, full_bw_count, full_bw_now) =
+            go_down_transition.expect("BBR never left PROBE_UP");
+
+        // Plateau drove the exit: 3 consecutive rounds with <25% delivery-rate
+        // growth set full_bw_now, and BBRIsTimeToGoDown() moved to PROBE_DOWN.
+        assert_eq!(
+            full_bw_count, MAX_FULL_BW_COUNT,
+            "full_bw_count should reach MAX_FULL_BW_COUNT on the plateau"
+        );
+        assert!(full_bw_now, "full_bw_now should be set on the plateau");
+        assert_eq!(
+            state,
+            BbrState::ProbeBw(ProbeBwSubstate::Down),
+            "PROBE_UP should transition to PROBE_DOWN on the plateau"
+        );
+    }
 }
