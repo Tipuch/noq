@@ -2196,4 +2196,165 @@ mod test {
              (round_count {round_count} > drain_start_round {drain_start_round} + 3)"
         );
     }
+
+    /// A.4 — Exiting DRAIN based on time.
+    /// equivalent to: <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#name-exiting-drain-based-on-time>
+    ///
+    /// Same simulator as A.1/A.3, driven through STARTUP -> DRAIN. On the DRAIN
+    /// edge the link is cut, simulating a STARTUP bandwidth over-estimate: DRAIN
+    /// keeps pacing off the stale (too-high) `max_bw`, so the queue never drains
+    /// and `C.inflight` stays above `BBRInflight(1.0)` (`get_inflight(1.0)`) for
+    /// several rounds. The inflight branch of `check_drain_done` never fires, so
+    /// the time fallback exits DRAIN once `round_count > drain_start_round + 3`,
+    /// even though `C.inflight` has not reached the target BDP.
+    #[test]
+    fn drain_exits_to_probe_bw_on_time() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// STARTUP bottleneck bandwidth: 100 Mbit/s in bytes/sec
+        const BW: f64 = 12_500_000.0;
+        /// propagation round-trip time (100ms), matching A.1/A.3
+        const RTT_NS: u64 = 100_000_000;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+        /// Fraction of the STARTUP bandwidth surviving into DRAIN. `max_bw` holds
+        /// its STARTUP peak through DRAIN, so DRAIN paces at 0.5 * BW. The draft's
+        /// 10% cut is too small here: at 0.9 * BW the link still outruns that
+        /// pacing and the queue drains (inflight-branch exit). The surviving link
+        /// must be below 0.5 * BW for the queue to persist, so use 0.4.
+        const DRAIN_BW_FACTOR: f64 = 0.4;
+
+        // Drive the production default configuration.
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            ack_ns: u64,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        // time at which the bottleneck finishes serving everything queued so far
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // bottleneck serialization time per MSS; cut on the DRAIN edge
+        let mut btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
+
+        let mut drain_start_round: Option<u64> = None;
+        // per-round (round_count, inflight, bdp) while in DRAIN
+        let mut drain_round_samples: Vec<(u64, u64, u64)> = Vec::new();
+        let mut last_sampled_round: Option<u64> = None;
+        // DRAIN -> PROBE_BW edge: (state, inflight, bdp, round)
+        let mut probe_bw_transition: Option<(BbrState, u64, u64, u64)> = None;
+
+        for _ in 0..1_000_000 {
+            let cwnd = bbr.window();
+            let can_send = inflight + MSS <= cwnd;
+            let next_ack = flight.front().map(|p| p.ack_ns);
+
+            // The sender always has data; send whenever the window allows and a
+            // send is due no later than the next ack, otherwise process an ack.
+            let do_send = can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                now_ns = now_ns.max(next_send_ns);
+                let send_ns = now_ns;
+                // enqueue at the FIFO bottleneck, served at the current rate
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let ack_ns = finish + RET_NS;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                });
+
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.ack_ns);
+                inflight -= MSS;
+                rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
+                bbr.on_end_acks(at(now_ns), inflight, false, Some(p.pn));
+
+                // STARTUP -> DRAIN edge: cut the link (over-estimate), record round
+                if bbr.state == BbrState::Drain && drain_start_round.is_none() {
+                    drain_start_round = Some(bbr.drain_start_round);
+                    btl_service_ns =
+                        (MSS as f64 / (BW * DRAIN_BW_FACTOR) * 1e9).round() as u64;
+                }
+
+                // sample inflight vs BBRInflight(1.0) once per DRAIN round
+                if bbr.state == BbrState::Drain && last_sampled_round != Some(bbr.round_count) {
+                    let bdp = bbr.get_inflight(1.0);
+                    drain_round_samples.push((bbr.round_count, inflight, bdp));
+                    last_sampled_round = Some(bbr.round_count);
+                }
+
+                if matches!(bbr.state, BbrState::ProbeBw(_)) {
+                    let bdp = bbr.get_inflight(1.0);
+                    probe_bw_transition = Some((bbr.state, inflight, bdp, bbr.round_count));
+                    break;
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        let drain_start_round = drain_start_round.expect("BBR never entered DRAIN");
+        let (state, inflight_at_exit, bdp_at_exit, round_count) =
+            probe_bw_transition.expect("BBR never left DRAIN");
+
+        // DRAIN exits to PROBE_BW.
+        assert!(
+            matches!(
+                state,
+                BbrState::ProbeBw(ProbeBwSubstate::Down | ProbeBwSubstate::Cruise)
+            ),
+            "DRAIN should transition to PROBE_BW, got {state:?}"
+        );
+
+        // Time fallback drove the exit: after 3 full DRAIN rounds...
+        assert!(
+            round_count > drain_start_round + 3,
+            "expected time-driven DRAIN exit at round_count > drain_start_round + 3, \
+             got round_count {round_count}, drain_start_round {drain_start_round}"
+        );
+
+        // ...with C.inflight still above target (inflight branch never fired).
+        assert!(
+            inflight_at_exit > bdp_at_exit,
+            "expected time-driven exit with inflight still above target: \
+             inflight {inflight_at_exit} <= BBRInflight(1.0) {bdp_at_exit}"
+        );
+
+        // inflight stayed above target every round in DRAIN
+        assert!(
+            drain_round_samples
+                .iter()
+                .all(|&(_, ifl, bdp)| ifl > bdp),
+            "C.inflight dropped to/below BBRInflight(1.0) during DRAIN: {drain_round_samples:?}"
+        );
+        assert!(
+            drain_round_samples.len() >= 3,
+            "expected several round trips observed in DRAIN, got {}",
+            drain_round_samples.len()
+        );
+    }
 }
