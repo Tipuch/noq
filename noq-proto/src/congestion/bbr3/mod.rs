@@ -105,6 +105,12 @@ const FULL_BW_GROWTH: f64 = 1.25;
 /// maximum number of rounds needed before we consider that the pipe is full <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.1.2-6>
 const MAX_FULL_BW_COUNT: u64 = 3;
 
+/// equivalent to BBRStartupFullLossCnt: the minimum number of discontiguous loss
+/// events observed within a single round trip before the STARTUP high-loss
+/// estimator is allowed to exit STARTUP.
+/// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-5.3.1.3>
+const STARTUP_FULL_LOSS_CNT: u64 = 6;
+
 /// when setting `bw_probe_up_rounds` when raising our inflight long term slope we don't go above this
 /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.6-8>
 const MAX_LONG_TERM_PROBE_UP_ROUNDS: u32 = 30;
@@ -443,6 +449,11 @@ pub struct Bbr3 {
     loss_round_delivered: u64,
     /// equivalent to BBR.loss_in_round: flag set to true when loss occurs during the round
     loss_in_round: bool,
+    /// equivalent to BBR.loss_events_in_round: count of discontiguous loss events
+    /// observed in the current round trip, used by the STARTUP high-loss exit
+    /// (BBRStartupFullLossCnt criterion). Reset at each loss-round boundary.
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-5.3.1.3>
+    loss_events_in_round: u64,
     /// equivalent to BBR.probe_rtt_done_stamp: timestamp when probe RTT state is finished
     probe_rtt_done_stamp: Option<Instant>,
     /// equivalent to BBR.probe_rtt_round_done: set once per round when BBR.probe_rtt_done_stamp to check if we need to switch state
@@ -569,6 +580,7 @@ impl Bbr3 {
             cycle_stamp: None,
             ack_phase: AckPhase::ProbeStarting,
             bw_probe_samples: false,
+            loss_events_in_round: 0,
             loss_round_delivered: 0,
             loss_in_round: false,
             probe_rtt_done_stamp: None,
@@ -605,6 +617,7 @@ impl Bbr3 {
         }
         self.save_state_upon_loss();
         self.loss_in_round = true;
+        self.loss_events_in_round = self.loss_events_in_round.saturating_add(1);
     }
 
     /// equivalent to BBRSaveStateUponLoss <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.11.1>
@@ -689,13 +702,29 @@ impl Bbr3 {
         false
     }
 
-    /// equivalent to BBRCheckStartupHighLoss <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.1.3>
+    /// equivalent to BBRCheckStartupHighLoss <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#section-5.3.1.3>
+    ///
+    /// Exits STARTUP on loss when all three draft criteria are met over a single
+    /// round trip:
+    ///  1. the flow has been losing for at least one full round trip
+    ///     (`loss_round_start` && `loss_in_round`),
+    ///  2. the loss rate exceeds `LOSS_THRESH` (via `is_inflight_too_high`),
+    ///  3. at least `STARTUP_FULL_LOSS_CNT` discontiguous loss events occurred in
+    ///     that round trip (`loss_events_in_round`).
+    ///
+    /// The draft's alternative rule for connections without selective ACKs ("exit
+    /// on any loss during fast recovery") does not apply: QUIC ACKs are always
+    /// selective, so `C.has_selective_acks` is effectively always true. This is
+    /// the same reason `is_inflight_too_high` omits the non-SACK clause.
     fn check_startup_high_loss(&mut self) {
         if self.full_bw_reached {
             return;
         }
 
-        if self.is_inflight_too_high() {
+        if self.loss_round_start
+            && self.loss_events_in_round >= STARTUP_FULL_LOSS_CNT
+            && self.is_inflight_too_high()
+        {
             let mut new_inflight_hi = self.bdp.max(self.inflight_latest);
             if let Some(rate_sample) = self.rs
                 && new_inflight_hi < rate_sample.delivered
@@ -704,6 +733,11 @@ impl Bbr3 {
             }
             self.inflight_longterm = new_inflight_hi;
             self.full_bw_reached = true;
+            self.full_bw_now = true;
+        }
+
+        if self.loss_round_start {
+            self.loss_events_in_round = 0;
         }
     }
 
@@ -1310,7 +1344,6 @@ impl Bbr3 {
     /// equivalent to BBRUpdateModelAndState <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.2.3>
     fn update_model_and_state(&mut self, p: BbrPacket, now: Instant) {
         self.update_latest_delivery_signals();
-        self.reset_congestion_signals();
         self.update_congestion_signals(p);
         self.update_ack_aggregation(now);
         self.check_full_bw_reached();
@@ -1475,6 +1508,7 @@ impl Controller for Bbr3 {
                     rate_sample.prior_time = p.delivered_time;
                     rate_sample.is_app_limited = p.is_app_limited;
                     rate_sample.tx_in_flight = p.tx_in_flight;
+                    rate_sample.lost = self.lost.saturating_sub(p.lost);
                     rate_sample.send_elapsed = p.send_time - p.first_send_time;
                     rate_sample.ack_elapsed = self.delivered_time.unwrap_or(now) - p.delivered_time;
                     rate_sample.last_end_seq = pn;
@@ -1498,7 +1532,7 @@ impl Controller for Bbr3 {
                     ack_elapsed: self.delivered_time.unwrap_or(now) - p.delivered_time,
                     newly_acked: bytes,
                     newly_lost: 0,
-                    lost: 0,
+                    lost: self.lost.saturating_sub(p.lost),
                     last_end_seq: pn,
                     last_packet: *p,
                 };
@@ -1739,5 +1773,272 @@ mod test {
         bbr3.pick_probe_wait();
         assert_eq!(bbr3.rounds_since_bw_probe, 1);
         assert_eq!(bbr3.bw_probe_wait, Duration::from_millis(2570));
+    }
+
+    /// A.1 — Exiting STARTUP on a bandwidth plateau.
+    /// equivalent to: <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#name-exiting-startup-on-bandwidt>
+    /// Drives a flow through the real `on_packet_sent`/`on_ack`/`on_end_acks`
+    /// path against a single-bottleneck link simulator: a constant bandwidth
+    /// `BW`, constant propagation `RTT`, and an infinite buffer (no loss).
+    /// Packets queue at the bottleneck and are served at `BW`, so once the pipe
+    /// fills the delivery-rate samples BBR measures plateau at `BW`. The sender
+    /// always has data queued, so it is never application-limited.
+    ///
+    /// Asserts that, once the measured delivery rate stops growing by >=25% for
+    /// 3 consecutive rounds (`full_bw_count` == `MAX_FULL_BW_COUNT`),
+    /// `full_bw_now`/`full_bw_reached` are set, the bandwidth estimate
+    /// (`max_bw`) sits within 2% of the simulated link bandwidth, and the flow
+    /// transitions from STARTUP straight to DRAIN.
+    #[test]
+    fn startup_exits_to_drain_on_bandwidth_plateau() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated bottleneck bandwidth: 100 Mbit/s in bytes/sec
+        const BW: f64 = 12_500_000.0;
+        /// Simulated propagation round-trip time. Kept large (100ms) so the
+        /// transient ProbeRTT that BBR enters on the first ack (its
+        /// `probe_rtt_min_stamp` starts unset, initializing `min_rtt`) spans
+        /// fewer than `MAX_FULL_BW_COUNT` rounds and cannot falsely complete the
+        /// plateau there; the flow bounces back to STARTUP and ramps cleanly.
+        const RTT_NS: u64 = 100_000_000;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+
+        // bottleneck serialization time for one MSS-sized packet
+        let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
+
+        // Drive the production default configuration.
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            ack_ns: u64,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        // time at which the bottleneck finishes serving everything queued so far
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // captured on the STARTUP -> DRAIN edge (DRAIN is only ever entered from
+        // STARTUP, via check_startup_done). BBR dips through a transient ProbeRTT
+        // right after the first ack, so we run until DRAIN rather than breaking on
+        // the first non-STARTUP state.
+        let mut transition: Option<(u64, bool, bool, f64)> = None;
+
+        for _ in 0..1_000_000 {
+            let cwnd = bbr.window();
+            let can_send = inflight + MSS <= cwnd;
+            let next_ack = flight.front().map(|p| p.ack_ns);
+
+            // The sender always has data; send whenever the window allows and a
+            // send is due no later than the next ack, otherwise process an ack.
+            let do_send = can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                now_ns = now_ns.max(next_send_ns);
+                let send_ns = now_ns;
+                // enqueue at the FIFO bottleneck, served at BW
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let ack_ns = finish + RET_NS;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                });
+
+                // pace the next send at BBR's chosen pacing rate
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.ack_ns);
+                inflight -= MSS;
+                rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
+                bbr.on_end_acks(at(now_ns), inflight, false, Some(p.pn));
+                if bbr.state == BbrState::Drain {
+                    transition = Some((
+                        bbr.full_bw_count,
+                        bbr.full_bw_now,
+                        bbr.full_bw_reached,
+                        bbr.max_bw,
+                    ));
+                    break;
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        // The break condition guarantees we landed on the STARTUP -> DRAIN edge.
+        let (full_bw_count, full_bw_now, full_bw_reached, max_bw) =
+            transition.expect("BBR never left STARTUP");
+
+        // Plateau detected: 3 consecutive rounds with <25% delivery-rate growth.
+        assert_eq!(full_bw_count, MAX_FULL_BW_COUNT);
+        assert!(full_bw_now, "full_bw_now should be set on plateau");
+        assert!(full_bw_reached, "full_bw_reached should be set on plateau");
+        // Bandwidth estimate within 2% of the simulated link bandwidth.
+        let err = (max_bw - BW).abs() / BW;
+        assert!(
+            err < 0.02,
+            "max_bw {max_bw} not within 2% of simulated {BW} (rel err {err})"
+        );
+    }
+
+    /// A.2 — Exiting STARTUP on loss when application-limited.
+    /// equivalent to: <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-06.html#name-exiting-startup-on-loss-whe>
+    ///
+    /// Drives a STARTUP flow whose delivery-rate samples are all
+    /// application-limited (the app keeps only `APP_WINDOW` bytes outstanding, well
+    /// below cwnd), so `check_full_bw_reached` bails on every round
+    /// (`rate_sample.is_app_limited` short-circuit) and the bandwidth-plateau
+    /// path can never end STARTUP. Loss is then injected above `LOSS_THRESH`
+    /// (2%), with at least `STARTUP_FULL_LOSS_CNT` discontiguous losses per round
+    /// trip, so `check_startup_high_loss` observes the high loss rate and ends
+    /// STARTUP: `full_bw_now`/`full_bw_reached` become true and the flow
+    /// transitions STARTUP -> DRAIN, purely from loss.
+    #[test]
+    fn startup_exits_to_drain_on_loss_when_app_limited() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated bottleneck bandwidth: 100 Mbit/s in bytes/sec
+        const BW: f64 = 12_500_000.0;
+        /// simulated propagation round-trip time (100ms), matching A.1
+        const RTT_NS: u64 = 100_000_000;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+        /// application window: bytes the app keeps outstanding. Fixed and well
+        /// below the STARTUP cwnd so the sender is application-limited (never
+        /// cwnd-limited), which blocks the bandwidth-plateau exit and isolates
+        /// the loss path. Sized so a single round trip carries at least
+        /// `STARTUP_FULL_LOSS_CNT` losses at the `LOSS_PERIOD` rate below.
+        const APP_WINDOW: u64 = 200 * MSS;
+        /// drop 1 in every `LOSS_PERIOD` packets -> 4% loss, above `LOSS_THRESH`
+        /// (2%), spread evenly so each round trip carries loss over its full
+        /// sequence range.
+        const LOSS_PERIOD: u64 = 25;
+
+        // bottleneck serialization time for one MSS-sized packet
+        let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
+
+        // Drive the production default configuration.
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            ack_ns: u64,
+            lost: bool,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        // time at which the bottleneck finishes serving everything queued so far
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // Whether BBRCheckStartupHighLoss ever observed a too-high loss rate
+        // (the A.2 signal). Sampled right after each ack is processed.
+        let mut observed_high_loss = false;
+
+        // captured on the STARTUP -> DRAIN edge (DRAIN is only ever entered from
+        // STARTUP, via check_startup_done). A transient ProbeRTT dip right after
+        // the first ack bounces back to STARTUP, so we run until DRAIN.
+        let mut transition: Option<(u64, bool, bool)> = None;
+
+        for _ in 0..1_000_000 {
+            // Application-limited: only send while the (small) app window has
+            // room, independent of cwnd.
+            let can_send = inflight + MSS <= APP_WINDOW.min(bbr.window());
+            let next_ack = flight.front().map(|p| p.ack_ns);
+
+            if can_send && next_ack.is_none_or(|ack| now_ns <= ack) {
+                let send_ns = now_ns;
+                // enqueue at the FIFO bottleneck, served at BW
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let ack_ns = finish + RET_NS;
+                let lost = pn % LOSS_PERIOD == LOSS_PERIOD - 1;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                    lost,
+                });
+                // Emulate the connection layer's C.app_limited (the index of the
+                // last packet sent while the app had no more data). BBR's folded
+                // `on_end_acks` can only ever raise `app_limited` to the largest
+                // *acked* pn and clears it as soon as a larger pn is acked, so it
+                // cannot keep samples app-limited on its own; set it to the last
+                // sent pn, as a genuinely app-limited quinn connection would.
+                bbr.app_limited = pn;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.ack_ns);
+                inflight -= MSS;
+                if p.lost {
+                    bbr.on_packet_lost(MSS as u16, p.pn, at(now_ns));
+                } else {
+                    rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                    bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, true, &rtt_est);
+                }
+                // Sample before on_end_acks clears the rate sample's loss fields.
+                observed_high_loss |= bbr.is_inflight_too_high();
+                bbr.on_end_acks(at(now_ns), inflight, true, Some(p.pn));
+                if bbr.state == BbrState::Drain {
+                    transition = Some((bbr.full_bw_count, bbr.full_bw_now, bbr.full_bw_reached));
+                    break;
+                }
+            } else {
+                // app window drained and nothing left to ack: advance to next send
+                now_ns += btl_service_ns;
+            }
+        }
+
+        // Landed on the STARTUP -> DRAIN edge.
+        let (full_bw_count, full_bw_now, full_bw_reached) =
+            transition.expect("BBR never left STARTUP on loss");
+
+        // Loss, not the plateau path, drove the exit: the plateau path is
+        // blocked by app-limited samples, so full_bw_count stayed below the
+        // 3-round plateau threshold.
+        assert!(
+            full_bw_count < MAX_FULL_BW_COUNT,
+            "expected loss-driven exit, but plateau counter reached {full_bw_count}"
+        );
+        assert!(
+            observed_high_loss,
+            "BBRCheckStartupHighLoss never observed a too-high loss rate"
+        );
+        assert!(full_bw_reached, "full_bw_reached should be set on high loss");
+        assert!(full_bw_now, "full_bw_now should be set on high loss");
     }
 }
