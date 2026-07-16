@@ -3148,4 +3148,232 @@ mod test {
              BBRInflight(1.0) ({cruise_inflight_1})"
         );
     }
+
+    /// A.9 — Exiting PROBE_DOWN after max time.
+    /// equivalent to BBRIsTimeToProbeBW:
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.5.3-6>
+    ///
+    /// Same single-bottleneck simulator as A.8, driven STARTUP -> DRAIN -> PROBE_BW
+    /// and run until PROBE_BW has cycled through PROBE_UP and back into a PROBE_DOWN
+    /// phase (carrying the standing queue PROBE_UP built). This exercises the *other*
+    /// PROBE_DOWN exit: not `BBRIsTimeToCruise` (A.8), but the elapsed-time trigger
+    /// `BBRIsTimeToProbeBW`, which `update_probe_bw_cycle_phase` checks *first* in its
+    /// PROBE_DOWN arm — so when it fires, PROBE_DOWN goes straight to PROBE_REFILL,
+    /// bypassing PROBE_CRUISE.
+    ///
+    /// The obstacle is that PROBE_DOWN's job is normally to drain: `pacing_gain` is
+    /// `ProbeDownPacingGain` (0.90), so at the full link rate the sender undershoots,
+    /// the queue empties, and `BBRIsTimeToCruise` fires within ~1s — well before the
+    /// 2-3s `bw_probe_wait` (that is A.8). To keep `C.inflight` from dropping to the
+    /// cruise thresholds, the simulator holds the available bandwidth ~10% below the
+    /// sender's *current* pacing rate for the whole PROBE_DOWN phase (see
+    /// `DOWN_LINK_FRACTION`): the bottleneck stays marginally congested, so the
+    /// standing queue — and hence `C.inflight` — persists above the cruise thresholds
+    /// instead of draining.
+    ///
+    /// A caveat this test pins down deliberately: in this loss-free, single-flow
+    /// model `inflight_longterm` is never lowered from its `u64::MAX` init, so
+    /// `BBRInflightWithHeadroom()` is unbounded and the *binding* cruise threshold is
+    /// `BBRInflight(1.0)` (~BDP). The residual queue can only be held above that for
+    /// a little over the 2 s `MIN_PROBE_WAIT`, so the probe RNG seed is fixed to make
+    /// `bw_probe_wait` land near its 2 s floor; the elapsed-time trigger then fires
+    /// just before the queue would have drained to the cruise threshold.
+    ///
+    /// `start_probe_bw_down` stamped `cycle_stamp = now` and picked `bw_probe_wait`
+    /// on entry. Once `now > cycle_stamp + bw_probe_wait`, `has_elapsed_in_phase` is
+    /// true, `BBRIsTimeToProbeBW` returns true, and `start_probe_bw_refill` moves
+    /// PROBE_DOWN -> PROBE_REFILL with `pacing_gain` reset to `DefaultPacingGain`.
+    /// The Reno-coexistence disjunct is not the trigger: `rounds_since_bw_probe` was
+    /// reset at down entry and the ~2 s wait (~20 rounds at a 100 ms RTT) elapses
+    /// well before the `min(target_inflight(), MAX_RENO_ROUNDS)` = 63-round threshold.
+    ///
+    /// Asserts that: the flow entered PROBE_DOWN via PROBE_UP with
+    /// `pacing_gain == ProbeDownPacingGain` (0.90); PROBE_CRUISE was never entered
+    /// after the PROBE_DOWN entry; at the exit `now` had passed
+    /// `cycle_stamp + bw_probe_wait` (the `BBRIsTimeToProbeBW` elapsed-time
+    /// condition); and the flow transitioned directly to PROBE_REFILL with
+    /// `pacing_gain` back at `DefaultPacingGain`.
+    #[test]
+    fn probe_bw_exits_probe_down_to_probe_refill_on_max_time() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated bottleneck bandwidth: 100 Mbit/s in bytes/sec
+        const BW: f64 = 12_500_000.0;
+        /// simulated propagation round-trip time (100ms), matching A.1/A.3/A.5/A.8
+        const RTT_NS: u64 = 100_000_000;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+        /// While in PROBE_DOWN, hold the bottleneck at this fraction of the sender's
+        /// current pacing rate, i.e. ~10% below what BBR is sending. This keeps the
+        /// link marginally slower than the flow, so the standing queue built during
+        /// PROBE_UP persists and `C.inflight` stays above the cruise thresholds
+        /// instead of draining (which would trigger `BBRIsTimeToCruise`, cf. A.8).
+        const DOWN_LINK_FRACTION: f64 = 0.9;
+
+        // bottleneck serialization time for one MSS-sized packet at full BW
+        let full_btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
+        let mut btl_service_ns: u64 = full_btl_service_ns;
+
+        // Drive the production default configuration, but with a fixed probe RNG
+        // seed. bw_probe_wait is MIN_PROBE_WAIT_MS (2s) plus a seed-dependent 0-1s;
+        // this seed lands it near the 2s floor, the only regime where the residual
+        // PROBE_UP queue can outlast the wait and expose the time-based exit.
+        let mut config = Bbr3Config::default();
+        config.probe_rng_seed = Some([6; 16]);
+        let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            ack_ns: u64,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        // time at which the bottleneck finishes serving everything queued so far
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // Whether the flow has reached the PROBE_UP phase; the PROBE_DOWN we care
+        // about is the one PROBE_UP cycles back into (it carries the standing queue),
+        // not the initial DRAIN -> PROBE_DOWN entry.
+        let mut reached_probe_up = false;
+        // pacing_gain captured on the PROBE_UP -> PROBE_DOWN edge.
+        let mut down_gain: Option<f64> = None;
+        // Deadline after which BBRIsTimeToProbeBW's elapsed-time trigger fires:
+        // cycle_stamp + bw_probe_wait, in simulator nanoseconds.
+        let mut probe_deadline_ns: Option<u64> = None;
+        // Whether PROBE_CRUISE was ever observed after the PROBE_DOWN entry; must
+        // stay false for the exit to be "direct" to PROBE_REFILL.
+        let mut saw_cruise = false;
+        // Captured on the PROBE_DOWN -> PROBE_REFILL edge: (pacing_gain, now_ns).
+        let mut refill_edge: Option<(f64, u64)> = None;
+
+        for _ in 0..1_000_000 {
+            let cwnd = bbr.window();
+            let can_send = inflight + MSS <= cwnd;
+            let next_ack = flight.front().map(|p| p.ack_ns);
+
+            // The sender always has data; send whenever the window allows and a
+            // send is due no later than the next ack, otherwise process an ack.
+            let do_send = can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                // Once in PROBE_DOWN, hold the bottleneck ~10% below the sender's
+                // current pacing so the pipe stays congested and the queue persists.
+                if down_gain.is_some() {
+                    let link = DOWN_LINK_FRACTION * bbr.pacing_rate.max(1.0);
+                    btl_service_ns = (MSS as f64 / link * 1e9).round() as u64;
+                }
+                now_ns = now_ns.max(next_send_ns);
+                let send_ns = now_ns;
+                // enqueue at the FIFO bottleneck, served at the current link rate
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let ack_ns = finish + RET_NS;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                });
+
+                // pace the next send at BBR's chosen pacing rate.
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.ack_ns);
+                inflight -= MSS;
+                rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
+                bbr.on_end_acks(at(now_ns), inflight, false, Some(p.pn));
+
+                if bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Up) {
+                    reached_probe_up = true;
+                }
+
+                // On the PROBE_UP -> PROBE_DOWN entry (only meaningful once PROBE_UP
+                // has been entered, and only the first time): capture the pacing gain
+                // and record the bw_probe_wait deadline stamped by
+                // start_probe_bw_down. From here the send path holds the link below
+                // the sender's rate (see DOWN_LINK_FRACTION).
+                if reached_probe_up
+                    && down_gain.is_none()
+                    && bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Down)
+                {
+                    down_gain = Some(bbr.pacing_gain);
+                    // cycle_stamp was stamped at at(now_ns) during this on_ack.
+                    probe_deadline_ns = Some(now_ns + bbr.bw_probe_wait.as_nanos() as u64);
+                }
+
+                // A PROBE_CRUISE seen after the down entry would mean the exit was
+                // not direct to PROBE_REFILL.
+                if down_gain.is_some() && bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Cruise) {
+                    saw_cruise = true;
+                    break;
+                }
+
+                // Capture the PROBE_DOWN -> PROBE_REFILL edge and stop.
+                if down_gain.is_some() && bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Refill) {
+                    refill_edge = Some((bbr.pacing_gain, now_ns));
+                    break;
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        // Entered PROBE_DOWN via PROBE_UP, pacing at ProbeDownPacingGain (0.90).
+        assert!(reached_probe_up, "BBR never reached the PROBE_UP phase");
+        let down_gain = down_gain.expect("BBR never entered PROBE_DOWN after PROBE_UP");
+        assert_eq!(
+            down_gain, bbr.probe_bw_down_pacing_gain,
+            "PROBE_DOWN pacing_gain should be ProbeDownPacingGain"
+        );
+        assert_eq!(
+            down_gain, PROBE_BW_DOWN_PACING_GAIN,
+            "ProbeDownPacingGain should be 0.90"
+        );
+
+        // The exit was direct: PROBE_CRUISE was never entered.
+        assert!(
+            !saw_cruise,
+            "PROBE_DOWN should exit straight to PROBE_REFILL, never PROBE_CRUISE"
+        );
+
+        // Transitioned to PROBE_REFILL.
+        let (refill_gain, refill_now_ns) =
+            refill_edge.expect("PROBE_DOWN never transitioned to PROBE_REFILL");
+        assert_eq!(
+            bbr.state,
+            BbrState::ProbeBw(ProbeBwSubstate::Refill),
+            "flow should have transitioned to PROBE_REFILL"
+        );
+        // BBRIsTimeToProbeBW's elapsed-time trigger: now had passed
+        // cycle_stamp + bw_probe_wait (has_elapsed_in_phase is a strict `>`).
+        let probe_deadline_ns =
+            probe_deadline_ns.expect("bw_probe_wait deadline was never recorded");
+        assert!(
+            refill_now_ns > probe_deadline_ns,
+            "PROBE_REFILL should be entered only after bw_probe_wait elapsed \
+             (now {refill_now_ns} ns vs deadline {probe_deadline_ns} ns)"
+        );
+        // Refill resets pacing_gain to DefaultPacingGain.
+        assert_eq!(
+            refill_gain, bbr.default_pacing_gain,
+            "PROBE_REFILL pacing_gain should be DefaultPacingGain"
+        );
+    }
 }
