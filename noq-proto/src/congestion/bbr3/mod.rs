@@ -1454,6 +1454,7 @@ impl Bbr3 {
 }
 impl Controller for Bbr3 {
     fn on_packet_sent(&mut self, now: Instant, bytes: u16, pn: u64) {
+        self.handle_restart_from_idle(now);
         if self.inflight == 0 {
             self.first_send_time = Some(now);
             self.delivered_time = Some(now);
@@ -1474,7 +1475,6 @@ impl Controller for Bbr3 {
             stale: false,
             round_count: self.round_count,
         });
-        self.handle_restart_from_idle(now);
     }
 
     fn on_ack(
@@ -3622,6 +3622,233 @@ mod test {
         assert!(
             sends_after_exit > 0,
             "flow did not resume sending after exiting PROBE_RTT"
+        );
+    }
+
+    /// A.11 — Skipping PROBE_RTT due to application-limited (restart-from-idle) sending.
+    /// equivalent to BBRHandleRestartFromIdle / BBRCheckProbeRTT:
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.4.1>
+    ///
+    /// Same infinite-buffer, single-bottleneck FIFO simulator as A.10 (constant link
+    /// rate, constant propagation delay), driven STARTUP -> DRAIN -> PROBE_BW. Then the
+    /// application stops offering data: every in-flight packet is acked with no new
+    /// sends, so `C.inflight` drains to 0 and the connection goes idle. Virtual time is
+    /// then advanced past `BBR.ProbeRTTInterval` (5 s) with nothing in flight — long
+    /// enough that the periodic min-RTT re-probe is due (`probe_rtt_expired` becomes
+    /// true on the next `update_min_rtt`), exactly the condition that drove the PROBE_RTT
+    /// entry in A.10.
+    ///
+    /// The difference here is the idle gap. When the application resumes and sends the
+    /// first packet, `on_packet_sent` calls `handle_restart_from_idle`: because
+    /// `C.inflight` was 0 and the connection is application-limited (`C.app_limited != 0`),
+    /// it sets `BBR.idle_restart = true`. On the resulting ack, `check_probe_rtt` sees
+    /// `probe_rtt_expired` true but refuses to `enter_probe_rtt` because of the
+    /// `!idle_restart` guard — an idle period is itself deemed a sufficient drain of the
+    /// bottleneck queue, so a formal PROBE_RTT is unnecessary. `idle_restart` is then
+    /// cleared once a delivering ack arrives, and the refreshed `probe_rtt_min_stamp`
+    /// keeps expiry from re-firing on the following acks.
+    ///
+    /// Asserts that: the flow reached PROBE_BW with `full_bw_reached` and then drained to
+    /// idle (`C.inflight == 0`) while still in PROBE_BW; more than ProbeRTTInterval (5 s)
+    /// elapsed during the idle gap; the first send after idle set `BBR.idle_restart`; and
+    /// although the min-RTT re-probe was due at that point (`probe_rtt_expired` true), the
+    /// connection never entered PROBE_RTT over the subsequent rounds.
+    #[test]
+    fn probe_bw_skips_probe_rtt_on_restart_from_idle() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated bottleneck bandwidth: 100 Mbit/s in bytes/sec
+        const BW: f64 = 12_500_000.0;
+        /// simulated propagation round-trip time (100ms), matching A.10
+        const RTT_NS: u64 = 100_000_000;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+
+        let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
+
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            ack_ns: u64,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // Phase 1: drive STARTUP -> DRAIN -> PROBE_BW, stopping as soon as the flow is in
+        // PROBE_BW with the bandwidth model considered full. The application then stops.
+        let mut reached_probe_bw = false;
+        for _ in 0..2_000_000 {
+            let cwnd = bbr.window();
+            let can_send = inflight + MSS <= cwnd;
+            let next_ack = flight.front().map(|p| p.ack_ns);
+            let do_send = can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                now_ns = now_ns.max(next_send_ns);
+                let send_ns = now_ns;
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let ack_ns = finish + RET_NS;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight { pn, send_ns, ack_ns });
+
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.ack_ns);
+                inflight -= MSS;
+                rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
+                bbr.on_end_acks(at(now_ns), inflight, false, Some(p.pn));
+
+                if bbr.full_bw_reached && matches!(bbr.state, BbrState::ProbeBw(_)) {
+                    reached_probe_bw = true;
+                    break;
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+        assert!(
+            reached_probe_bw,
+            "BBR never reached PROBE_BW with full_bw_reached"
+        );
+
+        // Phase 2: the application pauses. Ack every remaining in-flight packet without
+        // sending anything new, so the connection goes fully idle (C.inflight == 0).
+        while let Some(p) = flight.pop_front() {
+            now_ns = now_ns.max(p.ack_ns);
+            inflight -= MSS;
+            rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+            bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
+            bbr.on_end_acks(at(now_ns), inflight, false, Some(p.pn));
+        }
+        assert_eq!(inflight, 0, "harness should have drained all in-flight data");
+        assert_eq!(bbr.inflight, 0, "C.inflight should be 0 once the app goes idle");
+        assert!(
+            matches!(bbr.state, BbrState::ProbeBw(_)),
+            "flow should still be in PROBE_BW when it goes idle, got {:?}",
+            bbr.state
+        );
+        let idle_start_ns = now_ns;
+
+        // Phase 3: stay idle past BBR.ProbeRTTInterval (5 s), so the periodic min-RTT
+        // re-probe becomes due. Nothing is in flight, so no BBR callbacks fire; time just
+        // advances. With no data to send during the gap, the connection is app-limited.
+        now_ns = idle_start_ns + PROBE_RTT_INTERVAL_SEC * 1_000_000_000 + 2 * RTT_NS;
+        bbr.app_limited = pn;
+        assert!(
+            now_ns - idle_start_ns >= PROBE_RTT_INTERVAL_SEC * 1_000_000_000,
+            "idle gap must exceed ProbeRTTInterval (5 s)"
+        );
+
+        // Phase 4: the application resumes and sends one packet. handle_restart_from_idle
+        // runs on this transmit and must set BBR.idle_restart because C.inflight was 0 and
+        // the connection is app-limited.
+        let resume_pn = pn;
+        {
+            let send_ns = now_ns;
+            let arrival = send_ns + FWD_NS;
+            let service_start = arrival.max(btl_free_ns);
+            let finish = service_start + btl_service_ns;
+            btl_free_ns = finish;
+            let ack_ns = finish + RET_NS;
+
+            bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+            inflight += MSS;
+            flight.push_back(InFlight { pn, send_ns, ack_ns });
+            next_send_ns = now_ns;
+            pn += 1;
+        }
+        assert!(
+            bbr.idle_restart,
+            "handle_restart_from_idle should set BBR.idle_restart on the first send \
+             after an idle, app-limited period"
+        );
+
+        // Phase 5: keep sending/acking. On the resume packet's ack the min-RTT re-probe is
+        // due (probe_rtt_expired true), yet PROBE_RTT must be skipped because idle_restart
+        // is set. Run enough rounds to prove it stays skipped.
+        let mut probe_rtt_expired_at_resume: Option<bool> = None;
+        let mut entered_probe_rtt = false;
+        let mut acks_after_resume: u64 = 0;
+        for _ in 0..2_000_000 {
+            let cwnd = bbr.window();
+            let can_send = inflight + MSS <= cwnd;
+            let next_ack = flight.front().map(|p| p.ack_ns);
+            let do_send = can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                now_ns = now_ns.max(next_send_ns);
+                let send_ns = now_ns;
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let ack_ns = finish + RET_NS;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight { pn, send_ns, ack_ns });
+
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.ack_ns);
+                inflight -= MSS;
+                rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
+                bbr.on_end_acks(at(now_ns), inflight, false, Some(p.pn));
+
+                if p.pn == resume_pn {
+                    // Snapshot right after the restarting packet's ack: the re-probe was
+                    // due (probe_rtt_expired) so only idle_restart could suppress entry.
+                    probe_rtt_expired_at_resume = Some(bbr.probe_rtt_expired);
+                }
+                acks_after_resume += 1;
+
+                if bbr.state == BbrState::ProbeRtt {
+                    entered_probe_rtt = true;
+                    break;
+                }
+                if acks_after_resume >= 40 {
+                    break;
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        // The min-RTT re-probe was due at resume — the same trigger that entered
+        // PROBE_RTT in A.10 — so idle_restart is the only thing that could suppress entry.
+        assert_eq!(
+            probe_rtt_expired_at_resume,
+            Some(true),
+            "probe_rtt_expired should be true at resume (5 s elapsed), making the \
+             PROBE_RTT skip attributable to idle_restart"
+        );
+        // The connection skipped PROBE_RTT: idleness was a sufficient queue drain.
+        assert!(
+            !entered_probe_rtt,
+            "connection must skip PROBE_RTT after restarting from idle (idle_restart set)"
         );
     }
 }
