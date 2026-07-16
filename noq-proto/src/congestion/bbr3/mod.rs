@@ -2938,4 +2938,214 @@ mod test {
             "full_bw_count must never reach MAX_FULL_BW_COUNT on application-limited samples (was {max_full_bw_count})"
         );
     }
+
+    /// A.8 — Exiting PROBE_DOWN on inflight.
+    /// equivalent to BBRIsTimeToCruise:
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.6-8>
+    ///
+    /// Same infinite-buffer, single-bottleneck simulator as A.5 (constant
+    /// bandwidth `BW`, constant propagation `RTT`, no loss, sender always has
+    /// data), driven STARTUP -> DRAIN -> PROBE_BW and kept running until PROBE_BW
+    /// has cycled through PROBE_UP and back into a PROBE_DOWN phase. PROBE_UP paces
+    /// at `ProbeBwUpPacingGain` (1.25) and builds a standing queue, so on the
+    /// PROBE_UP -> PROBE_DOWN edge `C.inflight` sits well above both cruise
+    /// thresholds — there is a genuine queue to drain (distinct from the very
+    /// first DRAIN -> PROBE_DOWN entry, where DRAIN has already emptied the pipe).
+    ///
+    /// In PROBE_DOWN `pacing_gain` is `ProbeDownPacingGain` (0.90), so the sender
+    /// paces below the link rate and the standing queue drains at ~0.1*`BW`. Each
+    /// ack runs `update_probe_bw_cycle_phase`, whose PROBE_DOWN arm first checks
+    /// `maybe_enter_probe_bw_refill` (still false: `bw_probe_wait` is 2-3s and
+    /// `rounds_since_bw_probe` was reset at down entry, so neither the elapsed-time
+    /// nor the Reno-coexistence trigger fires within the short drain) and then
+    /// `maybe_update_budget_and_time_to_cruise` (`BBRIsTimeToCruise`). The latter
+    /// returns true only once `C.inflight` has fallen to <= both
+    /// `BBRInflightWithHeadroom()` and `BBRInflight(1.0)`, at which point
+    /// `start_probe_bw_cruise` moves PROBE_DOWN -> PROBE_CRUISE.
+    ///
+    /// `update_probe_bw_cycle_phase` reads `self.inflight`, which the previous
+    /// `on_end_acks` set from the simulator's `inflight` one tick earlier, so the
+    /// deciding value lags the loop's `inflight` by a single MSS — the same lag
+    /// A.3's `check_drain_done` relies on. Because the queue only shrinks, the
+    /// post-transition `C.inflight` (slightly smaller still) is likewise <= both
+    /// thresholds, so the thresholds recomputed right after the edge witness the
+    /// same condition that fired it (`start_probe_bw_cruise` touches neither
+    /// `max_bw`, `min_rtt`, `inflight_longterm`, nor `C.inflight`).
+    ///
+    /// Asserts that: the flow entered PROBE_DOWN via PROBE_UP with
+    /// `pacing_gain == ProbeDownPacingGain` (0.90) and `C.inflight` above at least
+    /// one cruise threshold (a real queue to drain); the flow then transitioned to
+    /// PROBE_CRUISE with `pacing_gain` back at `DefaultPacingGain`; and at that
+    /// edge `C.inflight` was <= both `BBRInflightWithHeadroom()` and
+    /// `BBRInflight(1.0)`.
+    #[test]
+    fn probe_bw_exits_probe_down_to_probe_cruise_on_inflight() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated bottleneck bandwidth: 100 Mbit/s in bytes/sec
+        const BW: f64 = 12_500_000.0;
+        /// simulated propagation round-trip time (100ms), matching A.1/A.3/A.5
+        const RTT_NS: u64 = 100_000_000;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+
+        // bottleneck serialization time for one MSS-sized packet
+        let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
+
+        // Drive the production default configuration.
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            ack_ns: u64,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        // time at which the bottleneck finishes serving everything queued so far
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // Whether the flow has reached the PROBE_UP phase; the PROBE_DOWN we care
+        // about is the one PROBE_UP cycles back into (it carries the standing queue
+        // PROBE_UP built), not the initial DRAIN -> PROBE_DOWN entry.
+        let mut reached_probe_up = false;
+        // Captured on the PROBE_UP -> PROBE_DOWN edge: (pacing_gain, C.inflight,
+        // BBRInflightWithHeadroom(), BBRInflight(1.0)) at entry, before any drain.
+        let mut down_entry: Option<(f64, u64, u64, u64)> = None;
+        // Captured on the PROBE_DOWN -> PROBE_CRUISE edge: (pacing_gain,
+        // C.inflight, BBRInflightWithHeadroom(), BBRInflight(1.0)).
+        let mut cruise_edge: Option<(f64, u64, u64, u64)> = None;
+
+        for _ in 0..1_000_000 {
+            let cwnd = bbr.window();
+            let can_send = inflight + MSS <= cwnd;
+            let next_ack = flight.front().map(|p| p.ack_ns);
+
+            // The sender always has data; send whenever the window allows and a
+            // send is due no later than the next ack, otherwise process an ack.
+            let do_send = can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                now_ns = now_ns.max(next_send_ns);
+                let send_ns = now_ns;
+                // enqueue at the FIFO bottleneck, served at BW
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let ack_ns = finish + RET_NS;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                });
+
+                // pace the next send at BBR's chosen pacing rate; in PROBE_DOWN
+                // this is BW * 0.90, so the flow undershoots and the standing queue
+                // built during PROBE_UP drains.
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.ack_ns);
+                inflight -= MSS;
+                rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
+                bbr.on_end_acks(at(now_ns), inflight, false, Some(p.pn));
+
+                if bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Up) {
+                    reached_probe_up = true;
+                }
+
+                // Capture the PROBE_UP -> PROBE_DOWN entry (only meaningful once
+                // PROBE_UP has actually been entered, and only the first time).
+                if reached_probe_up
+                    && down_entry.is_none()
+                    && bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Down)
+                {
+                    down_entry = Some((
+                        bbr.pacing_gain,
+                        bbr.inflight,
+                        bbr.inflight_with_headroom(),
+                        bbr.get_inflight(1.0),
+                    ));
+                }
+
+                // Capture the PROBE_DOWN -> PROBE_CRUISE edge and stop. Reachable
+                // only after the down entry has been recorded.
+                if down_entry.is_some() && bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Cruise) {
+                    cruise_edge = Some((
+                        bbr.pacing_gain,
+                        bbr.inflight,
+                        bbr.inflight_with_headroom(),
+                        bbr.get_inflight(1.0),
+                    ));
+                    break;
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        // Entered PROBE_DOWN via PROBE_UP, pacing at ProbeDownPacingGain (0.90),
+        // with a genuine queue still to drain.
+        assert!(reached_probe_up, "BBR never reached the PROBE_UP phase");
+        let (down_gain, down_inflight, down_headroom, down_inflight_1) =
+            down_entry.expect("BBR never entered PROBE_DOWN after PROBE_UP");
+        assert_eq!(
+            down_gain, bbr.probe_bw_down_pacing_gain,
+            "PROBE_DOWN pacing_gain should be ProbeDownPacingGain"
+        );
+        assert_eq!(
+            down_gain, PROBE_BW_DOWN_PACING_GAIN,
+            "ProbeDownPacingGain should be 0.90"
+        );
+        // A standing queue was present at entry: C.inflight exceeded at least one
+        // cruise threshold, so cruise could not fire immediately and a real drain
+        // had to happen.
+        assert!(
+            down_inflight > down_headroom || down_inflight > down_inflight_1,
+            "expected a standing queue at PROBE_DOWN entry (inflight {down_inflight} vs \
+             headroom {down_headroom}, inflight(1.0) {down_inflight_1})"
+        );
+
+        // Drained into PROBE_CRUISE.
+        let (cruise_gain, cruise_inflight, cruise_headroom, cruise_inflight_1) =
+            cruise_edge.expect("PROBE_DOWN never transitioned to PROBE_CRUISE");
+        assert_eq!(
+            bbr.state,
+            BbrState::ProbeBw(ProbeBwSubstate::Cruise),
+            "flow should have transitioned to PROBE_CRUISE"
+        );
+        // Cruise resets pacing_gain to DefaultPacingGain.
+        assert_eq!(
+            cruise_gain, bbr.default_pacing_gain,
+            "PROBE_CRUISE pacing_gain should be DefaultPacingGain"
+        );
+        // BBRIsTimeToCruise held: C.inflight fell to <= both thresholds. The queue
+        // only shrinks, so the value recomputed just after the edge still <= both,
+        // matching the (one-tick-larger) value that actually fired the transition.
+        assert!(
+            cruise_inflight <= cruise_headroom,
+            "at PROBE_CRUISE, inflight ({cruise_inflight}) should be <= \
+             BBRInflightWithHeadroom() ({cruise_headroom})"
+        );
+        assert!(
+            cruise_inflight <= cruise_inflight_1,
+            "at PROBE_CRUISE, inflight ({cruise_inflight}) should be <= \
+             BBRInflight(1.0) ({cruise_inflight_1})"
+        );
+    }
 }
