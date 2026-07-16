@@ -632,16 +632,13 @@ impl Bbr3 {
     /// equivalent to BBRInflightAtLoss <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.2-11>
     /// We check at what prefix of packet did losses exceed `loss_thresh`
     fn inflight_at_loss(&mut self, packet_size: u64) -> u64 {
-        if let Some(rate_sample) = self.rs {
-            let inflight_prev = rate_sample.tx_in_flight.saturating_sub(packet_size);
-            let inflight_prev_threshold = LOSS_THRESH * inflight_prev as f64;
-            let lost_prev = rate_sample.lost.saturating_sub(packet_size);
-            let compared_loss = (inflight_prev_threshold.round() as u64) - lost_prev;
-            let lost_prefix = compared_loss as f64 / (1.0 - LOSS_THRESH);
-            let inflight_at_loss = inflight_prev + lost_prefix as u64;
-            return inflight_at_loss;
-        }
-        0
+        let Some(rate_sample) = self.rs else {
+            return 0;
+        };
+        let inflight_prev = rate_sample.tx_in_flight.saturating_sub(packet_size) as f64;
+        let lost_prev = rate_sample.lost.saturating_sub(packet_size) as f64;
+        let lost_prefix = (LOSS_THRESH * inflight_prev - lost_prev) / (1.0 - LOSS_THRESH);
+        (inflight_prev + lost_prefix) as u64
     }
 
     /// equivalent to BBRSaveCwnd <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.6.4.4-13>
@@ -1445,11 +1442,12 @@ impl Bbr3 {
             rate_sample.tx_in_flight = p.tx_in_flight;
             rate_sample.lost = self.lost.saturating_sub(p.lost);
             rate_sample.is_app_limited = p.is_app_limited;
+            self.rs = Some(rate_sample);
             if self.is_inflight_too_high() {
                 rate_sample.tx_in_flight = self.inflight_at_loss(p.size as u64);
+                self.rs = Some(rate_sample);
                 self.handle_inflight_too_high(now);
             }
-            self.rs = Some(rate_sample);
         }
         self.packets.remove(packet_index);
     }
@@ -2038,7 +2036,10 @@ mod test {
             observed_high_loss,
             "BBRCheckStartupHighLoss never observed a too-high loss rate"
         );
-        assert!(full_bw_reached, "full_bw_reached should be set on high loss");
+        assert!(
+            full_bw_reached,
+            "full_bw_reached should be set on high loss"
+        );
         assert!(full_bw_now, "full_bw_now should be set on high loss");
     }
 
@@ -2296,8 +2297,7 @@ mod test {
                 // STARTUP -> DRAIN edge: cut the link (over-estimate), record round
                 if bbr.state == BbrState::Drain && drain_start_round.is_none() {
                     drain_start_round = Some(bbr.drain_start_round);
-                    btl_service_ns =
-                        (MSS as f64 / (BW * DRAIN_BW_FACTOR) * 1e9).round() as u64;
+                    btl_service_ns = (MSS as f64 / (BW * DRAIN_BW_FACTOR) * 1e9).round() as u64;
                 }
 
                 // sample inflight vs BBRInflight(1.0) once per DRAIN round
@@ -2346,9 +2346,7 @@ mod test {
 
         // inflight stayed above target every round in DRAIN
         assert!(
-            drain_round_samples
-                .iter()
-                .all(|&(_, ifl, bdp)| ifl > bdp),
+            drain_round_samples.iter().all(|&(_, ifl, bdp)| ifl > bdp),
             "C.inflight dropped to/below BBRInflight(1.0) during DRAIN: {drain_round_samples:?}"
         );
         assert!(
@@ -2468,11 +2466,8 @@ mod test {
 
                 // Capture the PROBE_UP -> PROBE_DOWN edge (only meaningful once
                 // PROBE_UP has actually been entered).
-                if reached_probe_up
-                    && bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Down)
-                {
-                    go_down_transition =
-                        Some((bbr.state, bbr.full_bw_count, bbr.full_bw_now));
+                if reached_probe_up && bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Down) {
+                    go_down_transition = Some((bbr.state, bbr.full_bw_count, bbr.full_bw_now));
                     break;
                 }
             } else {
@@ -2496,6 +2491,221 @@ mod test {
             state,
             BbrState::ProbeBw(ProbeBwSubstate::Down),
             "PROBE_UP should transition to PROBE_DOWN on the plateau"
+        );
+    }
+
+    /// A.6 — Exiting PROBE_UP on loss when application-limited.
+    /// equivalent to BBRHandleInflightTooHigh:
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.2-1>
+    ///
+    /// NOTE: the loss-driven PROBE_UP exit runs through `handle_inflight_too_high`
+    /// (BBRHandleInflightTooHigh), reached per-lost-packet from
+    /// `process_lost_packet`, NOT through `maybe_go_down` (BBRIsTimeToGoDown).
+    /// BBRIsTimeToGoDown only inspects the cwnd-limited/plateau signals
+    /// (`full_bw_now`) and never the loss rate, so high loss cannot trigger it;
+    /// the plateau path (A.5) is what BBRIsTimeToGoDown covers. This test drives
+    /// the actual code path that ends PROBE_UP on excess loss.
+    ///
+    /// Same single-bottleneck simulator as A.1/A.3/A.5, run in two phases:
+    ///  1. Not application-limited, no loss, full-cwnd (identical to A.5) until
+    ///     the flow cycles STARTUP -> DRAIN -> PROBE_BW -> PROBE_UP.
+    ///  2. Once PROBE_UP is entered, the app is throttled to a small fixed window
+    ///     (`APP_WINDOW`, well below cwnd) so every fresh sample is
+    ///     application-limited, and 1-in-`LOSS_PERIOD` packets are dropped -> a
+    ///     per-round loss rate (4%) above `BBR.LossThresh` (2%).
+    ///
+    /// In PROBE_UP `bw_probe_samples` is true, so each lost packet is fed through
+    /// `process_lost_packet`; `is_inflight_too_high()` sees the loss exceed
+    /// `LOSS_THRESH * tx_in_flight` and calls `handle_inflight_too_high`. Because
+    /// the deciding sample is application-limited, the `!is_app_limited` guard in
+    /// `handle_inflight_too_high` skips the `inflight_longterm` reduction (an
+    /// app-limited loss sample is not trusted to lower the long-term model), yet
+    /// the `state == PROBE_UP` branch still runs `start_probe_bw_down`
+    /// unconditionally.
+    ///
+    /// Asserts that, purely from loss, the flow transitions PROBE_UP ->
+    /// PROBE_DOWN with the deciding sample flagged application-limited, that the
+    /// plateau path did NOT drive it (`full_bw_now` stays false — blocked by the
+    /// app-limited short-circuit in `check_full_bw_reached`), and that
+    /// `inflight_longterm` is updated appropriately for an app-limited sample,
+    /// i.e. left unchanged across the transition rather than lowered.
+    #[test]
+    fn probe_bw_exits_probe_up_to_probe_down_on_loss_when_app_limited() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated bottleneck bandwidth: 100 Mbit/s in bytes/sec
+        const BW: f64 = 12_500_000.0;
+        /// simulated propagation round-trip time (100ms), matching A.1/A.3/A.5
+        const RTT_NS: u64 = 100_000_000;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+        /// application window used once PROBE_UP is reached: bytes the app keeps
+        /// outstanding. Fixed and well below the PROBE_UP cwnd (~2*BDP, ~1000
+        /// packets here) so the sender is application-limited (never
+        /// cwnd-limited), which keeps every sample app-limited and isolates the
+        /// loss path. Matches A.2's window.
+        const APP_WINDOW: u64 = 200 * MSS;
+        /// drop 1 in every `LOSS_PERIOD` packets -> 4% loss, above `LOSS_THRESH`
+        /// (2%), spread evenly so each round trip carries loss over its full
+        /// sequence range.
+        const LOSS_PERIOD: u64 = 25;
+
+        // bottleneck serialization time for one MSS-sized packet
+        let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
+
+        // Drive the production default configuration.
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            ack_ns: u64,
+            lost: bool,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        // time at which the bottleneck finishes serving everything queued so far
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // Phase 2 begins once PROBE_UP is reached: from then the app is limited
+        // to APP_WINDOW and packets are dropped at the LOSS_PERIOD rate.
+        let mut app_limited_phase = false;
+        let mut reached_probe_up = false;
+        // Captured on the loss-driven PROBE_UP -> PROBE_DOWN edge:
+        // (inflight_longterm before/after the deciding loss, whether the deciding
+        // sample was app-limited, full_bw_now at the edge).
+        let mut go_down: Option<(u64, u64, bool, bool)> = None;
+
+        for _ in 0..1_000_000 {
+            let cwnd = bbr.window();
+            let window_cap = if app_limited_phase {
+                APP_WINDOW.min(cwnd)
+            } else {
+                cwnd
+            };
+            let can_send = inflight + MSS <= window_cap;
+            let next_ack = flight.front().map(|p| p.ack_ns);
+
+            // Send whenever the window allows and a paced send is due no later
+            // than the next ack; otherwise process an ack. In the app-limited
+            // phase the small window is the binding limit, not cwnd.
+            let do_send = can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                now_ns = now_ns.max(next_send_ns);
+                let send_ns = now_ns;
+                // enqueue at the FIFO bottleneck, served at BW
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let ack_ns = finish + RET_NS;
+                // Only drop packets once app-limited (phase 2); phase 1 is loss
+                // free so the flow reaches PROBE_UP exactly as in A.5.
+                let lost = app_limited_phase && pn % LOSS_PERIOD == LOSS_PERIOD - 1;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                    lost,
+                });
+
+                if app_limited_phase {
+                    // Emulate the connection layer's C.app_limited (the index of
+                    // the last packet sent while the app had no more data) so the
+                    // next packet is stamped app-limited at send time. Same shape
+                    // as A.2: on_end_acks cannot keep samples app-limited on its
+                    // own, so drive it here.
+                    bbr.app_limited = pn;
+                }
+
+                // pace the next send at BBR's chosen pacing rate
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.ack_ns);
+                inflight -= MSS;
+                if p.lost {
+                    // Capture the loss-driven PROBE_UP -> PROBE_DOWN edge. The
+                    // transition happens inside on_packet_lost (via
+                    // handle_inflight_too_high), never on an ack, so any Up->Down
+                    // move seen here is attributable to this loss.
+                    let before_ilt = bbr.inflight_longterm;
+                    let was_up = bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Up);
+                    bbr.on_packet_lost(MSS as u16, p.pn, at(now_ns));
+                    if was_up && bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Down) {
+                        let app_lim = bbr.rs.is_some_and(|rs| rs.is_app_limited);
+                        go_down =
+                            Some((before_ilt, bbr.inflight_longterm, app_lim, bbr.full_bw_now));
+                        break;
+                    }
+                } else {
+                    rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                    bbr.on_ack(
+                        at(now_ns),
+                        at(p.send_ns),
+                        MSS,
+                        p.pn,
+                        app_limited_phase,
+                        &rtt_est,
+                    );
+                    bbr.on_end_acks(at(now_ns), inflight, app_limited_phase, Some(p.pn));
+
+                    // Flip to the application-limited, lossy phase the moment
+                    // PROBE_BW is entered, so that by the time the cycle reaches
+                    // PROBE_UP the pipe has already drained to APP_WINDOW and
+                    // every in-flight sample is app-limited (the plateau path
+                    // cannot fire on stale non-app-limited samples).
+                    if !app_limited_phase && matches!(bbr.state, BbrState::ProbeBw(_)) {
+                        app_limited_phase = true;
+                    }
+                    if bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Up) {
+                        reached_probe_up = true;
+                    }
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        // Landed on the loss-driven PROBE_UP -> PROBE_DOWN edge.
+        assert!(reached_probe_up, "BBR never reached the PROBE_UP phase");
+        let (before_ilt, after_ilt, app_lim, full_bw_now) =
+            go_down.expect("BBR never left PROBE_UP on loss");
+
+        // The deciding loss sample was application-limited.
+        assert!(
+            app_lim,
+            "deciding loss sample should be application-limited"
+        );
+        // Loss, not the plateau path, drove the exit: check_full_bw_reached bails
+        // on app-limited samples, so full_bw_now (BBRIsTimeToGoDown's plateau
+        // signal) never got set.
+        assert!(
+            !full_bw_now,
+            "expected loss-driven exit, but the plateau signal full_bw_now was set"
+        );
+        // Updated appropriately for an app-limited sample: handle_inflight_too_high
+        // skips the reduction (the !is_app_limited guard), so inflight_longterm is
+        // left unchanged across the transition rather than lowered toward
+        // max(tx_in_flight, target_inflight * BETA). A non-app-limited loss would
+        // instead set it here.
+        assert_eq!(
+            before_ilt, after_ilt,
+            "inflight_longterm should be unchanged on an app-limited loss exit"
         );
     }
 }
