@@ -2708,4 +2708,234 @@ mod test {
             "inflight_longterm should be unchanged on an app-limited loss exit"
         );
     }
+
+    /// A.7 — Never exiting STARTUP when application-limited with no loss.
+    ///
+    /// The negative counterpart to A.1 (plateau exit) and A.2 (loss exit): with
+    /// neither signal present, STARTUP must persist. STARTUP leaves for DRAIN only
+    /// via `check_startup_done`, which requires `full_bw_reached`
+    /// (`self.state == Startup && self.full_bw_reached` -> `enter_drain`), plus the
+    /// high-loss escape in `check_startup_high_loss`. When every round is
+    /// application-limited, `check_full_bw_reached` bails on the `is_app_limited`
+    /// guard, so `full_bw_now`/`full_bw_reached` are never set; with zero loss the
+    /// high-loss escape never fires either. Both STARTUP -> DRAIN triggers are
+    /// therefore closed.
+    ///
+    /// The one state change that still occurs is the scheduled min-RTT refresh:
+    /// with a constant RTT the min-RTT filter expires every `probe_rtt_interval`
+    /// (5s) and `check_probe_rtt` moves STARTUP -> PROBE_RTT. This is orthogonal to
+    /// the app-limited/loss exits A.7 concerns — and because `full_bw_reached` is
+    /// still false, `exit_probe_rtt` routes back to STARTUP (`enter_startup`)
+    /// rather than on to PROBE_BW. So the flow oscillates STARTUP <-> PROBE_RTT and
+    /// never advances past STARTUP, i.e. it stays in STARTUP indefinitely.
+    ///
+    /// Same infinite-buffer, single-bottleneck simulator as A.1/A.2, but the app
+    /// is limited to a small fixed window (`APP_WINDOW`, well below cwnd) from the
+    /// very first packet so every sample is application-limited, and no packet is
+    /// ever dropped.
+    ///
+    /// Runs long enough (`ROUNDS_TO_OBSERVE`, several `probe_rtt_interval`s) to
+    /// cover multiple PROBE_RTT interludes, and asserts that: the flow only ever
+    /// occupies STARTUP or PROBE_RTT (never DRAIN/PROBE_BW), at least one
+    /// PROBE_RTT interlude was exercised and returned to STARTUP, every observed
+    /// sample was application-limited, `full_bw_reached`/`full_bw_now` were never
+    /// set, and `full_bw_count` never reached `MAX_FULL_BW_COUNT`.
+    #[test]
+    fn startup_never_exits_when_app_limited_without_loss() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated bottleneck bandwidth: 100 Mbit/s in bytes/sec
+        const BW: f64 = 12_500_000.0;
+        /// simulated propagation round-trip time (100ms), matching A.1/A.2
+        const RTT_NS: u64 = 100_000_000;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+        /// bytes the app keeps outstanding, from the first packet on. Fixed and
+        /// well below cwnd (initial cwnd is ~109*MSS, and the app-limited delivery
+        /// rate keeps cwnd = cwnd_gain*bdp ~= 2.77*APP_WINDOW thereafter) so the
+        /// sender is application-limited, never cwnd-limited. Comfortably above
+        /// `min_pipe_cwnd` (4*MSS).
+        const APP_WINDOW: u64 = 20 * MSS;
+        /// rounds to observe before declaring "indefinitely". Each round is ~1 RTT
+        /// (100ms), so this spans ~16s — several `probe_rtt_interval`s (5s) — and
+        /// covers multiple STARTUP <-> PROBE_RTT oscillations.
+        const ROUNDS_TO_OBSERVE: u64 = 160;
+
+        // bottleneck serialization time for one MSS-sized packet
+        let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
+
+        // Drive the production default configuration.
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            ack_ns: u64,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        // time at which the bottleneck finishes serving everything queued so far
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // Signals gathered over the run; every assertion is checked after the loop.
+        // The set of states ever visited (must stay within {Startup, ProbeRtt}).
+        let mut saw_probe_rtt = false;
+        // A PROBE_RTT interlude was seen and the flow subsequently returned to
+        // STARTUP — proof exit_probe_rtt routed back to STARTUP, not on to
+        // PROBE_BW.
+        let mut returned_to_startup = false;
+        // Set true the moment any forbidden (past-STARTUP) state is entered.
+        let mut advanced_past_startup: Option<BbrState> = None;
+        // Whether every ack we processed carried an application-limited sample.
+        let mut all_samples_app_limited = true;
+        let mut samples_seen: u64 = 0;
+        // Highest full_bw_count / whether full_bw_now/full_bw_reached ever set.
+        let mut max_full_bw_count: u64 = 0;
+        let mut full_bw_now_ever = false;
+        let mut full_bw_reached_ever = false;
+
+        for _ in 0..1_000_000 {
+            let cwnd = bbr.window();
+            // The app never wants more than APP_WINDOW outstanding.
+            let window_cap = APP_WINDOW.min(cwnd);
+            let can_send = inflight + MSS <= window_cap;
+            let next_ack = flight.front().map(|p| p.ack_ns);
+
+            // Send whenever the small app window allows and a paced send is due no
+            // later than the next ack; otherwise process an ack. The app window is
+            // always the binding limit, not cwnd.
+            let do_send = can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                now_ns = now_ns.max(next_send_ns);
+                let send_ns = now_ns;
+                // enqueue at the FIFO bottleneck, served at BW (infinite buffer, no
+                // loss)
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let ack_ns = finish + RET_NS;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                });
+
+                // Emulate the connection layer's C.app_limited (index of the last
+                // packet sent while the app had no more data) so the next packet is
+                // stamped app-limited at send time. Same shape as A.2/A.6.
+                bbr.app_limited = pn;
+
+                // pace the next send at BBR's chosen pacing rate
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.ack_ns);
+                inflight -= MSS;
+                rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, true, &rtt_est);
+                bbr.on_end_acks(at(now_ns), inflight, true, Some(p.pn));
+
+                // Record the sample's app-limited flag, but only for STARTUP
+                // rounds: PROBE_RTT deliberately clamps cwnd to min_pipe_cwnd
+                // (below APP_WINDOW), so its samples are cwnd-limited by design and
+                // are not part of the app-limited premise.
+                if let Some(rs) = bbr.rs
+                    && bbr.state == BbrState::Startup
+                {
+                    samples_seen += 1;
+                    all_samples_app_limited &= rs.is_app_limited;
+                }
+                max_full_bw_count = max_full_bw_count.max(bbr.full_bw_count);
+                full_bw_now_ever |= bbr.full_bw_now;
+                full_bw_reached_ever |= bbr.full_bw_reached;
+
+                match bbr.state {
+                    BbrState::Startup => {
+                        // Returning to STARTUP after a PROBE_RTT interlude confirms
+                        // exit_probe_rtt routed back here (full_bw_reached false).
+                        if saw_probe_rtt {
+                            returned_to_startup = true;
+                        }
+                    }
+                    BbrState::ProbeRtt => {
+                        saw_probe_rtt = true;
+                    }
+                    // Any of these means STARTUP was actually left for the next
+                    // phase — the failure A.7 guards against.
+                    other => {
+                        advanced_past_startup.get_or_insert(other);
+                    }
+                }
+
+                if advanced_past_startup.is_some() || bbr.round_count >= ROUNDS_TO_OBSERVE {
+                    break;
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        // Never advanced past STARTUP: only STARTUP and the scheduled PROBE_RTT
+        // min-RTT refresh were ever entered.
+        assert!(
+            advanced_past_startup.is_none(),
+            "BBR left STARTUP for {:?} while application-limited with no loss",
+            advanced_past_startup,
+        );
+        // The run was long enough to actually exercise the oscillation.
+        assert!(
+            bbr.round_count >= ROUNDS_TO_OBSERVE,
+            "simulation ended early ({} rounds) before observing enough rounds",
+            bbr.round_count,
+        );
+        // The min-RTT refresh fired and returned to STARTUP (not on to PROBE_BW),
+        // proving STARTUP is genuinely re-entered rather than merely never left
+        // because time stood still.
+        assert!(saw_probe_rtt, "expected a scheduled PROBE_RTT interlude");
+        assert!(
+            returned_to_startup,
+            "PROBE_RTT should route back to STARTUP while full_bw_reached is false"
+        );
+        assert_eq!(
+            bbr.state,
+            BbrState::Startup,
+            "BBR should still be in STARTUP at the end of the run"
+        );
+        // The premise held: every sample really was application-limited.
+        assert!(samples_seen > 0, "no samples were observed");
+        assert!(
+            all_samples_app_limited,
+            "every sample should be application-limited"
+        );
+        // The plateau path never armed: check_full_bw_reached short-circuits on
+        // app-limited samples, so full_bw_reached/full_bw_now stayed false and
+        // full_bw_count never reached MAX_FULL_BW_COUNT.
+        assert!(
+            !full_bw_reached_ever,
+            "full_bw_reached must never be set on application-limited samples"
+        );
+        assert!(
+            !full_bw_now_ever,
+            "full_bw_now must never be set on application-limited samples"
+        );
+        assert!(
+            max_full_bw_count < MAX_FULL_BW_COUNT,
+            "full_bw_count must never reach MAX_FULL_BW_COUNT on application-limited samples (was {max_full_bw_count})"
+        );
+    }
 }
