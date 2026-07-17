@@ -1359,11 +1359,15 @@ impl Bbr3 {
     }
 
     /// equivalent to BBRSetSendQuantum <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.6.3>
-    /// this version is based on a version of bbr2 from quiche
+    /// this version is based on a version of bbr2 from quiche.
+    /// The low-rate floors are 1*SMSS / 2*SMSS (the segment size, matching quiche's
+    /// `r.max_datagram_size`, Linux tcp_bbr, msquic) — the 64KB `HIGH_PACE_MAX_QUANTUM` is only a
+    /// ceiling. Using `MAX_DATAGRAM_SIZE` (65527) here made `offload_budget` swamp `min_pipe_cwnd`,
+    /// so `BBR.MinPipeCwnd` could never floor `C.cwnd`.
     fn set_send_quantum(&mut self) {
         self.send_quantum = match self.pacing_rate {
-            rate if rate < PACING_RATE_1_2MBPS => MAX_DATAGRAM_SIZE,
-            rate if rate < PACING_RATE_24MBPS => 2 * MAX_DATAGRAM_SIZE,
+            rate if rate < PACING_RATE_1_2MBPS => self.smss,
+            rate if rate < PACING_RATE_24MBPS => 2 * self.smss,
             _ => min((self.pacing_rate / 1000.0) as u64, HIGH_PACE_MAX_QUANTUM),
         };
     }
@@ -4147,6 +4151,292 @@ mod test {
         assert!(
             cruise_bw_err < 0.05,
             "max_bw {peak_cruise_max_bw} not within 5% of simulated {BW} (rel err {cruise_bw_err})"
+        );
+    }
+
+    /// A.14 — Correctly managing sub-packet BDPs.
+    /// equivalent to BBRInflight / BBRQuantizationBudget (the BBR.MinPipeCwnd floor):
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.6.4.2>
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-2.7-4>
+    ///
+    /// On a very slow bottleneck the model-derived congestion window collapses below the
+    /// pipelining minimum. `BBR.MinPipeCwnd` (4 * SMSS) is the floor that keeps enough packets
+    /// outstanding to tolerate an "ACK every other packet" delayed-ACK receiver without
+    /// stalling. This test drives that regime and asserts the floor governs `C.cwnd` while the
+    /// pacing rate still tracks the low link bandwidth.
+    ///
+    /// A single-bottleneck FIFO link at `BW` = 50 kB/s with a small propagation delay. Because
+    /// the bottleneck serialization of one MSS (`MSS/BW` = 24ms) dominates the measured
+    /// min-RTT, the model's BDP estimate (`bw*min_rtt`) sits near a single packet — the
+    /// propagation BDP (`bw*prop`) is well under one packet. Either way the cruise inflight
+    /// budget `cwnd_gain*BDP` (cwnd_gain = DefaultCwndGain = 2) falls below `MinPipeCwnd`
+    /// (4 packets), so `MinPipeCwnd` is the binding floor on `C.cwnd`.
+    ///
+    /// Two phases over one bespoke loop (the shared `Sim` acks one packet per ack; this needs a
+    /// delayed-ACK receiver, so it drives the send/ack path directly like A.12/A.13):
+    ///  1. Reach steady-state PROBE_BW/PROBE_CRUISE with a plain receiver (one ACK per packet),
+    ///     driving STARTUP -> DRAIN -> PROBE_BW -> PROBE_CRUISE. Capture BDP, `C.cwnd`, the
+    ///     pacing rate and `MinPipeCwnd` at cruise entry.
+    ///  2. Switch to an "ACK every other packet" receiver: completed packets are released in
+    ///     pairs (the second packet's arrival triggers one ACK covering both), the delayed-ACK
+    ///     policy `MinPipeCwnd` exists to serve. Because the 4-packet floor keeps ~4 packets
+    ///     outstanding, a pair is always forming, so the bottleneck never idles waiting on a
+    ///     held ACK — the pipeline does not stall and throughput stays at `BW`. With only the
+    ///     sub-packet model budget (~1 packet) the receiver would hold its lone packet's ACK
+    ///     forever and the flow would deadlock; the floor is what prevents that.
+    ///
+    /// Asserts:
+    ///  - at cruise entry the model budget was genuinely sub-floor (`cwnd_gain*BDP <
+    ///    MinPipeCwnd`, BDP no more than ~2 packets) and `MinPipeCwnd == 4*MSS`;
+    ///  - `C.cwnd` sat exactly at `MinPipeCwnd` (the floor, not the tiny model budget, governs);
+    ///  - the pacing rate matched the low link bandwidth (within 5% of `BW`);
+    ///  - under the delayed-ACK receiver the pipeline never stalled: pairs genuinely formed,
+    ///    `C.cwnd` held at the 4-packet floor throughout, and achieved throughput stayed at
+    ///    `BW` (within 10%).
+    #[test]
+    fn probe_bw_floors_sub_packet_bdp_at_min_pipe_cwnd() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// bottleneck bandwidth: 8 Mbit/s (1 MB/s) in bytes/sec. Two constraints pin this:
+        ///  - cruise pacing (~0.99*BW) must stay below `PACING_RATE_1_2MBPS` (1.2 MB/s) so
+        ///    `set_send_quantum` picks the 1*SMSS floor; otherwise `offload_budget` exceeds
+        ///    `MinPipeCwnd` and the floor can't bind.
+        ///  - it must still be fast enough to reach PROBE_CRUISE well within the 10s min-RTT
+        ///    filter window, so the clean (drained) min-RTT sample from DRAIN survives to cruise
+        ///    rather than aging out and re-latching to a queued value.
+        const BW: f64 = 1_000_000.0;
+        /// small propagation round-trip time (0.4ms): the propagation BDP `bw*prop` = 400 bytes is
+        /// under one packet ("sub-packet BDP"). The measured clean min-RTT is `prop + MSS/BW`
+        /// (one packet serializes through the bottleneck), so the model BDP lands near a single
+        /// packet and the cruise budget `2*BDP` stays below the 4-packet `MinPipeCwnd`.
+        const PROP_NS: u64 = 400_000;
+        const FWD_NS: u64 = PROP_NS / 2;
+        const RET_NS: u64 = PROP_NS / 2;
+
+        // bottleneck serialization time for one MSS-sized packet
+        let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
+
+        // Seed the probe RNG so the PROBE_BW bw-probe wait (hence the cruise sojourn length) is
+        // deterministic and the pair-count target below is not flaky.
+        let seed: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let config = Bbr3Config {
+            probe_rng_seed: Some(seed),
+            ..Bbr3Config::default()
+        };
+        let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(PROP_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            ack_ns: u64,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        // time at which the bottleneck finishes serving everything queued so far
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // Delayed-ACK receiver is off until PROBE_CRUISE; before that one ACK per packet, as in
+        // probe_bw_exits_probe_down_to_probe_cruise_on_inflight.
+        let mut delayed_on = false;
+        // Packet number of the first packet of a pair still waiting for its partner (the
+        // "every other packet" hold). When the partner is sent, both are stamped with the
+        // partner's (later) arrival so they share one ACK instant.
+        let mut pending_first: Option<u64> = None;
+
+        // Captured at the first PROBE_CRUISE ack (plain receiver).
+        let mut cruise_capture: Option<(u64, u64, u64, f64, f64)> = None;
+
+        // Delayed-phase signals, asserted after the loop.
+        // Largest ACK event size (packets acked at one instant) on the delayed path.
+        let mut max_burst: usize = 0;
+        // Number of ACK events that covered exactly a pair (the every-other-packet policy).
+        let mut pair_events: usize = 0;
+        // C.cwnd never dropped below the 4-packet floor on any delayed ack.
+        let mut cwnd_floor_held = true;
+        // Bytes delivered, and the first/last delivery instant, while in the delayed phase — for
+        // the achieved-throughput (no-stall) check.
+        let mut delayed_delivered: u64 = 0;
+        let mut delayed_first_ns: Option<u64> = None;
+        let mut delayed_last_ns: u64 = 0;
+
+        for _ in 0..3_000_000 {
+            let cwnd = bbr.window();
+            let can_send = inflight + MSS <= cwnd;
+            let next_ack = flight.front().map(|p| p.ack_ns);
+            let do_send = can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                now_ns = now_ns.max(next_send_ns);
+                let send_ns = now_ns;
+                // enqueue at the FIFO bottleneck, served at BW
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let arrival_ns = finish + RET_NS;
+
+                // Delayed-ACK ("every other packet") pairing, assigned at send time so a pair
+                // shares one ACK instant without stalling paced sends in between: the first of a
+                // pair is provisionally stamped with its own arrival, then lifted to the second's
+                // (later) arrival when the partner is sent — both then release together. Off the
+                // delayed path each packet acks on its own arrival.
+                let ack_ns = if delayed_on {
+                    if let Some(first_pn) = pending_first.take() {
+                        // second of the pair: lift the held first to this (later) arrival
+                        for p in flight.iter_mut() {
+                            if p.pn == first_pn {
+                                p.ack_ns = arrival_ns;
+                            }
+                        }
+                        arrival_ns
+                    } else {
+                        pending_first = Some(pn);
+                        arrival_ns
+                    }
+                } else {
+                    arrival_ns
+                };
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight { pn, send_ns, ack_ns });
+
+                // pace the next send at BBR's chosen pacing rate
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(first) = flight.pop_front() {
+                // Gather every packet sharing this release instant: a delayed-ACK pair carries
+                // one ACK instant (equal ack_ns), so both release together; off the delayed path
+                // each ack_ns is unique and the burst degenerates to a single packet.
+                let burst_ack_ns = first.ack_ns;
+                let mut burst = vec![first];
+                while flight.front().is_some_and(|p| p.ack_ns == burst_ack_ns) {
+                    burst.push(flight.pop_front().unwrap());
+                }
+                now_ns = now_ns.max(burst_ack_ns);
+
+                let largest_pn = burst.iter().map(|p| p.pn).max().unwrap();
+                for p in &burst {
+                    inflight -= MSS;
+                    rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                    bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
+                }
+                bbr.on_end_acks(at(now_ns), inflight, false, Some(largest_pn));
+
+                let in_cruise = bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+
+                // First cruise ack (plain receiver): capture the model state, then turn the
+                // receiver delayed for the rest of the run.
+                if in_cruise && cruise_capture.is_none() {
+                    cruise_capture = Some((
+                        bbr.bdp,
+                        bbr.cwnd,
+                        bbr.min_pipe_cwnd,
+                        bbr.pacing_rate,
+                        bbr.default_cwnd_gain,
+                    ));
+                    delayed_on = true;
+                    continue;
+                }
+
+                if delayed_on {
+                    // Leaving PROBE_CRUISE ends the measured window (a fresh bw-probe would lift
+                    // cwnd above the floor); stop once we've gathered enough pairs.
+                    if !in_cruise {
+                        break;
+                    }
+                    max_burst = max_burst.max(burst.len());
+                    if burst.len() == 2 {
+                        pair_events += 1;
+                    }
+                    // The floor is a lower bound; delayed (paired) ACKs read as ACK aggregation,
+                    // so extra_acked may lift cwnd above it (as in A.13) — but never below.
+                    if bbr.cwnd < bbr.min_pipe_cwnd {
+                        cwnd_floor_held = false;
+                    }
+                    delayed_delivered += burst.len() as u64 * MSS;
+                    delayed_first_ns.get_or_insert(now_ns);
+                    delayed_last_ns = now_ns;
+
+                    // Cap well above one cruise sojourn; in practice the loop exits earlier when
+                    // the flow leaves PROBE_CRUISE (the `!in_cruise` break above).
+                    if pair_events >= 40 {
+                        break;
+                    }
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        let (bdp, cwnd, min_pipe_cwnd, pacing_rate, cwnd_gain) =
+            cruise_capture.expect("flow never reached PROBE_CRUISE");
+
+        // The model budget was genuinely sub-floor: a very low, near-single-packet BDP whose
+        // cruise inflight target (cwnd_gain*BDP) sits below the 4-packet MinPipeCwnd.
+        assert!(bdp > 0, "BDP should be defined once min-RTT is known");
+        assert!(
+            bdp <= 2 * MSS,
+            "expected a sub-two-packet BDP on this slow link, got {bdp} ({} packets)",
+            bdp as f64 / MSS as f64
+        );
+        assert!(
+            (cwnd_gain * bdp as f64) < min_pipe_cwnd as f64,
+            "model cruise budget cwnd_gain*BDP ({}) should be below MinPipeCwnd ({min_pipe_cwnd}) \
+             for the floor to bind",
+            cwnd_gain * bdp as f64
+        );
+        // MinPipeCwnd is 4 * SMSS.
+        assert_eq!(
+            min_pipe_cwnd,
+            4 * MSS,
+            "MinPipeCwnd should be 4 packets"
+        );
+        // The floor, not the tiny model budget, governs C.cwnd.
+        assert_eq!(
+            cwnd, min_pipe_cwnd,
+            "C.cwnd should sit at the MinPipeCwnd floor on a sub-packet BDP"
+        );
+        // Pacing still tracks the low link bandwidth (cruise pacing_gain = 1, 1% margin).
+        let pacing_err = (pacing_rate - BW).abs() / BW;
+        assert!(
+            pacing_err < 0.05,
+            "pacing_rate {pacing_rate} should match low link BW {BW} (rel err {pacing_err})"
+        );
+
+        // The delayed-ACK receiver was genuinely exercised: ACK events covered pairs.
+        assert!(
+            max_burst == 2 && pair_events >= 10,
+            "expected the every-other-packet receiver to produce ACK pairs \
+             (max_burst {max_burst}, pair_events {pair_events})"
+        );
+        // C.cwnd never dropped below the 4-packet floor throughout the delayed phase.
+        assert!(
+            cwnd_floor_held,
+            "C.cwnd should never drop below the MinPipeCwnd floor during the delayed-ACK phase"
+        );
+        // No stall: with 4 packets outstanding a pair is always forming, so the bottleneck never
+        // idled waiting on a held ACK — achieved throughput stayed at the link rate. A stall
+        // (as a sub-floor cwnd would cause) would collapse this far below BW.
+        let first_ns = delayed_first_ns.expect("no delayed-phase acks gathered");
+        let elapsed_s = (delayed_last_ns - first_ns) as f64 / 1e9;
+        assert!(elapsed_s > 0.0, "delayed phase had no elapsed time");
+        let throughput = delayed_delivered as f64 / elapsed_s;
+        let throughput_err = (throughput - BW).abs() / BW;
+        assert!(
+            throughput_err < 0.10,
+            "delayed-ACK throughput {throughput} should hold at link BW {BW} \
+             (rel err {throughput_err}); a stalled pipeline would fall well below"
         );
     }
 }
