@@ -3855,4 +3855,298 @@ mod test {
             "max_bw {max_bw} not within 5% of simulated {BW} (rel err {err})"
         );
     }
+
+    /// A.13 — Achieving expected cruise bandwidth on a link with ACK aggregation.
+    /// equivalent to BBRUpdateACKAggregation / BBRUpdateMaxInflight:
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.9>
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.6.4.2>
+    ///
+    /// The aggregation-in-STARTUP counterpart is A.12; this covers the same excess-data
+    /// mechanism in the steady-state PROBE_BW cruise phase, where the aggregation estimate
+    /// is drawn from the windowed max filter rather than a single round.
+    ///
+    /// Two phases over the same constant-rate, single-bottleneck FIFO simulator as A.1:
+    ///  1. Reach steady state with plain (unaggregated) delivery — one ACK per packet, as in
+    ///     `probe_bw_exits_probe_down_to_probe_cruise_on_inflight` — driving
+    ///     STARTUP -> DRAIN -> PROBE_BW and on into PROBE_CRUISE.
+    ///  2. On entering PROBE_CRUISE, switch the path to aggregate ACKs: completed packets are
+    ///     held and released in bursts on a fixed `AGG_NS` epoch grid (the L2 batching /
+    ///     radio-DRX behaviour A.12 models), so many packets share one delivery instant and
+    ///     the sender sees one ACK "event" cover a burst. The bottleneck still drains at
+    ///     exactly `BW`, so only ACK arrival *timing* is bursty; the average rate is unchanged.
+    ///
+    /// Each burst is fed exactly as the connection layer would (cf. `Connection::on_packet_acked`
+    /// looping over the newly-acked packets, then a single `on_end_acks`): one `on_ack` per
+    /// packet, all stamped with the same ack instant, followed by one `on_end_acks` carrying
+    /// the burst's largest packet number.
+    ///
+    /// Once `full_bw_reached` (true throughout PROBE_BW), `BBRUpdateACKAggregation` tracks the
+    /// per-round excess in a windowed max filter over the last `BBR.ExtraAckedFilterLen`
+    /// (`EXTRA_ACKED_FILTER_LEN`, 10) rounds and sets `BBR.extra_acked` to that max — unlike
+    /// STARTUP, which just remembers one round (A.12). `BBRUpdateMaxInflight` then adds
+    /// `extra_acked` on top of `cwnd_gain*BDP` (cruise `cwnd_gain` is `DefaultCwndGain` = 2),
+    /// so `C.cwnd` is lifted above `2*BDP`.
+    ///
+    /// Asserts that, in PROBE_CRUISE on the aggregating path:
+    ///  - the path genuinely aggregated (some ACK event covered many packets);
+    ///  - `extra_acked` became positive and equalled `extra_acked_filter.get_max()` on every
+    ///    ack — i.e. it is sourced from the windowed max filter, not the instantaneous round;
+    ///  - the windowed max held: within `EXTRA_ACKED_FILTER_LEN` rounds of the peak, a
+    ///    lower-excess round (an inter-ACK silence) never knocked `extra_acked` below that
+    ///    peak — the filter retained it, so the cwnd budget did not collapse between bursts;
+    ///  - `C.cwnd` exceeded `2*BDP` while `extra_acked>0` (the augmentation), and actual
+    ///    inflight rose above `2*BDP` too — the sender kept the pipe full across the silences
+    ///    rather than stalling at the un-augmented budget.
+    #[test]
+    fn probe_cruise_reaches_full_bw_with_ack_aggregation() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated bottleneck bandwidth: 100 Mbit/s in bytes/sec
+        const BW: f64 = 12_500_000.0;
+        /// simulated propagation round-trip time (100ms), matching A.1/A.12
+        const RTT_NS: u64 = 100_000_000;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+        /// ACK-aggregation epoch (enabled only once in PROBE_CRUISE). All packets whose
+        /// bottleneck service finishes within the same `AGG_NS` window have their ACKs
+        /// released together. 1ms is ~10 MSS-times at BW (bursty) yet well under the 100ms
+        /// RTT, so bursts stay within a round trip. Matches A.12.
+        const AGG_NS: u64 = 1_000_000;
+
+        // bottleneck serialization time for one MSS-sized packet
+        let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
+
+        // Drive the production default configuration.
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            ack_ns: u64,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        // time at which the bottleneck finishes serving everything queued so far
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // Aggregation is off until the flow reaches PROBE_CRUISE; before that the path acks
+        // one packet at a time (distinct ack_ns), exactly like the cruise-reaching harness in
+        // probe_bw_exits_probe_down_to_probe_cruise_on_inflight.
+        let mut agg_on = false;
+        let mut cruise_start_round: Option<u64> = None;
+
+        // Signals gathered while in PROBE_CRUISE; asserted after the loop.
+        // Largest ACK burst (packets acked at one instant) actually produced.
+        let mut max_burst: usize = 0;
+        // Highest BBR.extra_acked observed in cruise, and the round it was first seen.
+        let mut max_extra_acked: u64 = 0;
+        let mut peak_round: Option<u64> = None;
+        // extra_acked must be sourced from the windowed max filter on every cruise ack.
+        let mut extra_acked_is_filter_max = true;
+        // Largest amount by which C.cwnd sat above the un-augmented cruise budget (2*BDP) —
+        // i.e. the headroom BBRUpdateMaxInflight added from extra_acked.
+        let mut max_cwnd_augmentation: u64 = 0;
+        // The sender was never cwnd-blocked in cruise (cwnd stayed strictly above inflight on
+        // every ack); a stall would show up as inflight catching the cwnd cap.
+        let mut never_cwnd_blocked = true;
+        // Peak inflight seen in cruise — should stay near a full BDP (pipe kept full).
+        let mut max_inflight: u64 = 0;
+        // Peak max_bw in cruise — must stay ~BW, proving the bursts didn't inflate the
+        // delivery-rate estimate above the send rate (same sampler guard as A.12).
+        let mut peak_cruise_max_bw: f64 = 0.0;
+        // (round_count, extra_acked) at every cruise ack, for the windowed-retention check.
+        let mut cruise_samples: Vec<(u64, u64)> = Vec::new();
+
+        for _ in 0..3_000_000 {
+            let cwnd = bbr.window();
+            let can_send = inflight + MSS <= cwnd;
+            let next_ack = flight.front().map(|p| p.ack_ns);
+            let do_send = can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                now_ns = now_ns.max(next_send_ns);
+                let send_ns = now_ns;
+                // enqueue at the FIFO bottleneck, served at BW
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                // Once aggregating, hold the completed packet until the next AGG_NS epoch
+                // boundary at/after `finish` so packets finishing in the same window release
+                // together (identical ack_ns == one ACK event); otherwise ack as soon as it
+                // clears the bottleneck (+propagation), one ack per packet.
+                let ack_ns = if agg_on {
+                    finish.div_ceil(AGG_NS) * AGG_NS + RET_NS
+                } else {
+                    finish + RET_NS
+                };
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight { pn, send_ns, ack_ns });
+
+                // pace the next send at BBR's chosen pacing rate
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(first) = flight.pop_front() {
+                // Gather the whole aggregation burst: every in-flight packet sharing this
+                // release instant is acknowledged by the same ACK event. Off the aggregating
+                // path each ack_ns is unique, so bursts degenerate to a single packet.
+                let burst_ack_ns = first.ack_ns;
+                let mut burst = vec![first];
+                while flight.front().is_some_and(|p| p.ack_ns == burst_ack_ns) {
+                    burst.push(flight.pop_front().unwrap());
+                }
+                now_ns = now_ns.max(burst_ack_ns);
+
+                // Feed the burst as the connection layer does: one on_ack per packet (same
+                // ack instant), then a single on_end_acks with the largest pn in the burst.
+                let largest_pn = burst.last().map(|p| p.pn).unwrap();
+                for p in &burst {
+                    inflight -= MSS;
+                    rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                    bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
+                }
+                bbr.on_end_acks(at(now_ns), inflight, false, Some(largest_pn));
+
+                let in_cruise = bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+
+                // On the first cruise ack, turn the path aggregating for all subsequent sends.
+                if in_cruise && cruise_start_round.is_none() {
+                    agg_on = true;
+                    cruise_start_round = Some(bbr.round_count);
+                }
+
+                if in_cruise && agg_on {
+                    max_burst = max_burst.max(burst.len());
+
+                    let ea = bbr.extra_acked;
+                    // extra_acked is fed from the windowed max filter (full_bw_reached arm of
+                    // BBRUpdateACKAggregation), not the raw per-round excess.
+                    if ea != bbr.extra_acked_filter.get_max() {
+                        extra_acked_is_filter_max = false;
+                    }
+                    if ea > max_extra_acked {
+                        max_extra_acked = ea;
+                        peak_round = Some(bbr.round_count);
+                    }
+                    cruise_samples.push((bbr.round_count, ea));
+
+                    peak_cruise_max_bw = peak_cruise_max_bw.max(bbr.max_bw);
+                    max_inflight = max_inflight.max(inflight);
+                    if bbr.cwnd <= inflight {
+                        never_cwnd_blocked = false;
+                    }
+                    // bbr.bdp is refreshed to max_bw*min_rtt inside update_max_inflight on
+                    // every set_cwnd; 2*bdp is the un-augmented cruise budget (cwnd_gain 2), so
+                    // any excess of cwnd over 2*bdp is exactly the extra_acked headroom
+                    // BBRUpdateMaxInflight added.
+                    if bbr.bdp > 0 {
+                        max_cwnd_augmentation =
+                            max_cwnd_augmentation.max(bbr.cwnd.saturating_sub(2 * bbr.bdp));
+                    }
+
+                    // Gathered a couple of filter windows' worth of cruise rounds.
+                    if bbr.round_count - cruise_start_round.unwrap()
+                        >= 2 * EXTRA_ACKED_FILTER_LEN as u64
+                    {
+                        break;
+                    }
+                } else if cruise_start_round.is_some() && !in_cruise {
+                    // Left PROBE_CRUISE (on to PROBE_REFILL/UP); stop gathering.
+                    break;
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        // The flow reached PROBE_CRUISE and we gathered acks there.
+        let cruise_start_round =
+            cruise_start_round.expect("flow never reached PROBE_CRUISE");
+        assert!(
+            !cruise_samples.is_empty(),
+            "no acks gathered in PROBE_CRUISE"
+        );
+        // The cruise sojourn spanned at least one full filter window, so the windowed-max
+        // behaviour was actually exercised.
+        let last_round = cruise_samples.last().unwrap().0;
+        assert!(
+            last_round - cruise_start_round >= EXTRA_ACKED_FILTER_LEN as u64,
+            "cruise spanned only {} rounds, need >= {EXTRA_ACKED_FILTER_LEN} to exercise the filter",
+            last_round - cruise_start_round
+        );
+
+        // The path genuinely aggregated: at least one ACK event covered many packets.
+        assert!(
+            max_burst > 1,
+            "harness should have produced aggregated ACK bursts, max burst was {max_burst}"
+        );
+        // BBRUpdateACKAggregation estimated a positive excess from the bursts.
+        assert!(
+            max_extra_acked > 0,
+            "extra_acked should be positive on an aggregating path in cruise"
+        );
+        // extra_acked was sourced from the windowed max filter on every cruise ack.
+        assert!(
+            extra_acked_is_filter_max,
+            "extra_acked should equal extra_acked_filter.get_max() throughout cruise"
+        );
+
+        // Windowed max held: within EXTRA_ACKED_FILTER_LEN rounds of the peak, no lower-excess
+        // round (inter-ACK silence) drove extra_acked below the peak — the max filter retained
+        // it over its window, keeping the cwnd budget from collapsing between bursts.
+        let peak_round = peak_round.expect("no positive extra_acked observed in cruise");
+        for &(round, ea) in &cruise_samples {
+            if round > peak_round && round <= peak_round + EXTRA_ACKED_FILTER_LEN as u64 {
+                assert!(
+                    ea >= max_extra_acked,
+                    "extra_acked {ea} at round {round} fell below the peak {max_extra_acked} \
+                     (peak round {peak_round}) still inside the {EXTRA_ACKED_FILTER_LEN}-round filter window"
+                );
+            }
+        }
+
+        // C.cwnd carried the full extra_acked headroom: BBRUpdateMaxInflight adds extra_acked
+        // on top of cwnd_gain*BDP (cwnd_gain being DefaultCwndGain = 2 in cruise), so cwnd sat
+        // at least max_extra_acked above 2*BDP at the peak.
+        assert!(
+            max_cwnd_augmentation >= max_extra_acked,
+            "C.cwnd should sit >= max_extra_acked ({max_extra_acked}) above 2*BDP in cruise, \
+             observed augmentation {max_cwnd_augmentation}"
+        );
+        // That augmentation is what prevents an inter-ACK stall: cwnd stayed strictly above
+        // inflight on every cruise ack, so the sender was never cwnd-blocked despite the bursty,
+        // silence-punctuated acks — without the extra_acked headroom a burst could push inflight
+        // into the cwnd cap and stall the flow.
+        assert!(
+            never_cwnd_blocked,
+            "cwnd should stay above inflight throughout cruise (no cwnd-induced stall)"
+        );
+        // Full utilization was maintained: inflight stayed near a full BDP (the pipe never
+        // drained empty between bursts).
+        assert!(
+            max_inflight * 10 >= bbr.bdp * 9,
+            "inflight ({max_inflight}) should stay near a full BDP ({}) in cruise",
+            bbr.bdp
+        );
+        // The delivery-rate sampler was not fooled by the bursts: max_bw tracked the true
+        // bottleneck BW rather than the instantaneous burst rate (interval =
+        // max(send_elapsed, ack_elapsed) caps the sample at the send rate).
+        let cruise_bw_err = (peak_cruise_max_bw - BW).abs() / BW;
+        assert!(
+            cruise_bw_err < 0.05,
+            "max_bw {peak_cruise_max_bw} not within 5% of simulated {BW} (rel err {cruise_bw_err})"
+        );
+    }
 }
