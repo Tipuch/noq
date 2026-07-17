@@ -1389,6 +1389,10 @@ impl Connection {
         self.path_data_mut(path_id).app_limited =
             last_packet_number.is_none() && !congestion_blocked;
 
+        if congestion_blocked {
+            self.path_data_mut(path_id).congestion.on_cwnd_limited();
+        }
+
         match last_packet_number {
             Some(last_packet_number) => {
                 // Note that when sending in multiple spaces the last packet number will be

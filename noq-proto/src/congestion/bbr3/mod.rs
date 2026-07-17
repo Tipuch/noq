@@ -276,7 +276,10 @@ pub struct Bbr3 {
     /// (e.g. "pipe" from RFC6675 or "bytes_in_flight" from RFC9002). This MUST NOT include pure ACK packets.
     inflight: u64,
     /// equivalent to C.is_cwnd_limited: True if the connection has fully utilized C.cwnd at any point in the last packet-timed round trip.
+    /// Transport-provided (via `on_cwnd_limited`); snapshotted from `cwnd_limited_this_round` at each round boundary.
     is_cwnd_limited: bool,
+    /// ORs every cwnd-blocked send in the current round; snapshotted into `is_cwnd_limited` and cleared when the round advances.
+    cwnd_limited_this_round: bool,
     /// equivalent to BBR.cycle_count: The virtual time used by the BBR.max_bw filter window.
     /// since the BBR.max_bw_filter only needs to track samples from two time slots: the previous ProbeBW cycle and the current ProbeBW cycle.
     cycle_count: u64,
@@ -513,6 +516,7 @@ impl Bbr3 {
             delivered: 0,
             inflight: 0,
             is_cwnd_limited: false,
+            cwnd_limited_this_round: false,
             cycle_count: 0,
             cwnd: initial_cwnd,
             pacing_rate,
@@ -876,13 +880,16 @@ impl Bbr3 {
     /// equivalent to BBRStartRound <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.1-9>
     fn start_round(&mut self) {
         self.next_round_delivered = self.delivered;
-        self.is_cwnd_limited = false;
     }
 
     /// equivalent to BBRUpdateRound <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.1-9>
     fn update_round(&mut self, packet: BbrPacket) {
         if packet.delivered >= self.next_round_delivered {
             self.start_round();
+            // Snapshot the just-ended round's cwnd-limited status for this round's decisions, then
+            // reset the accumulator for the new round.
+            self.is_cwnd_limited = self.cwnd_limited_this_round;
+            self.cwnd_limited_this_round = false;
             self.round_count += 1;
             self.rounds_since_bw_probe += 1;
             self.round_start = true;
@@ -947,9 +954,9 @@ impl Bbr3 {
             let delta = self.bw_probe_up_acks / self.probe_up_cnt;
             self.bw_probe_up_acks -= delta * self.probe_up_cnt;
             self.inflight_longterm += delta;
-            if self.round_start {
-                self.raise_inflight_long_term_slope();
-            }
+        }
+        if self.round_start {
+            self.raise_inflight_long_term_slope();
         }
     }
 
@@ -1457,6 +1464,10 @@ impl Bbr3 {
     }
 }
 impl Controller for Bbr3 {
+    fn on_cwnd_limited(&mut self) {
+        self.cwnd_limited_this_round = true;
+    }
+
     fn on_packet_sent(&mut self, now: Instant, bytes: u16, pn: u64) {
         self.handle_restart_from_idle(now);
         if self.inflight == 0 {
@@ -1597,9 +1608,6 @@ impl Controller for Bbr3 {
                 if rate_sample.interval != Duration::ZERO {
                     rate_sample.delivery_rate =
                         rate_sample.delivered as f64 / rate_sample.interval.as_secs_f64();
-                }
-                if rate_sample.delivered >= self.cwnd {
-                    self.is_cwnd_limited = true;
                 }
                 self.rs = Some(rate_sample);
                 rate_sample.newly_acked = 0;
@@ -1842,6 +1850,11 @@ mod test {
         ) {
             for _ in 0..max_iters {
                 let can_send = self.inflight + self.mss <= self.bbr.window();
+                // Report the cwnd-blocked signal as the connection layer does: always-backlogged,
+                // so whenever the window (not pacing) is what stops the send, the flow is cwnd-limited.
+                if !can_send {
+                    self.bbr.on_cwnd_limited();
+                }
                 let next_ack = self.flight.front().map(|p| p.ack_ns);
                 let do_send = can_send && next_ack.is_none_or(|ack| self.next_send_ns <= ack);
 
@@ -4437,6 +4450,260 @@ mod test {
             throughput_err < 0.10,
             "delayed-ACK throughput {throughput} should hold at link BW {BW} \
              (rel err {throughput_err}); a stalled pipeline would fall well below"
+        );
+    }
+
+    /// A.15 — Increasing bandwidth 10x and ensuring full bandwidth is reached.
+    /// equivalent to BBRRaiseInflightLongtermSlope / BBRProbeInflightLongtermUpward:
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.6-8>
+    ///
+    /// After PROBE_BW is reached at a low link rate, the bottleneck bandwidth jumps 10x. In
+    /// PROBE_UP BBR grows `inflight_longterm` with an exponentially increasing per-round step so
+    /// it rediscovers a much larger BDP in O(log(BDP)) round trips rather than linearly.
+    ///
+    /// The step doubling comes from `raise_inflight_long_term_slope`, called once per round-start
+    /// while probing up: `growth_this_round = SMSS << bw_probe_up_rounds` and `bw_probe_up_rounds`
+    /// increments each round, so the unit of growth doubles every round. `probe_up_cnt` (bytes to
+    /// ack per +1 byte of `inflight_longterm`) is set to `cwnd / growth_this_round`, so over one
+    /// round (~cwnd bytes acked) `inflight_longterm` climbs by ~`growth_this_round` — a per-round
+    /// increment that doubles each round.
+    ///
+    /// The growth path only engages when the flow is genuinely cwnd-limited. That signal is
+    /// spec-defined as connection-provided (`C.is_cwnd_limited`), so the harness reports it exactly
+    /// as the connection layer does — calling `on_cwnd_limited` whenever a send is blocked by the
+    /// window rather than by pacing.
+    ///
+    /// A bespoke single-bottleneck FIFO loop (bandwidth changes mid-flight, which the shared `Sim`
+    /// can't express — cf. A.12/A.13/A.14, which also drive the path directly) with an always-
+    /// backlogged, paced sender. In PROBE_UP the pacing gain (1.25) drives sends above the delivery
+    /// rate, so the flow rides at cwnd (cwnd-limited) and the 25% surplus probes for more bandwidth.
+    ///  1. `BW_LO` = 10 Mbit/s. Ramp cleanly to `BW_LO` in PROBE_BW, then a brief 1-in-`LOSS_PERIOD`
+    ///     loss seeds a finite `inflight_longterm` (a PROBE_UP loss runs `handle_inflight_too_high`);
+    ///     the loss is switched off the instant it fires. Only a finite `inflight_longterm` gives the
+    ///     exponential slope a base to grow from.
+    ///  2. Jump the bottleneck rate 10x (`BW_HI` = 100 Mbit/s). PROBE_BW cycles into PROBE_UP, where
+    ///     `inflight_longterm` is grown back up. Record it at each PROBE_UP round-start; run until
+    ///     `max_bw` reaches `BW_HI`.
+    ///
+    /// Asserts:
+    ///  - at the bump the flow was in the low-rate regime (`max_bw` well below `BW_HI`);
+    ///  - the additive step added to `inflight_longterm` doubles each round trip — `bw_probe_up_rounds`
+    ///    (the `SMSS << bw_probe_up_rounds` slope) advances once per cwnd-limited round, and the
+    ///    per-round `inflight_longterm` increment grows geometrically (a sustained ~2x run);
+    ///  - the full 100 Mbit/s is rediscovered (`max_bw` >= 97% of `BW_HI`) within a small,
+    ///    O(log(BDP)) number of PROBE_UP round trips.
+    #[test]
+    fn probe_up_rediscovers_full_bw_after_10x_increase() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated propagation round-trip time (100ms), matching A.1
+        const RTT_NS: u64 = 100_000_000;
+        /// low link rate before the jump: 10 Mbit/s in bytes/sec
+        const BW_LO: f64 = 1_250_000.0;
+        /// high link rate after the jump: 100 Mbit/s in bytes/sec (10x)
+        const BW_HI: f64 = 12_500_000.0;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+        /// drop 1 in every `LOSS_PERIOD` packets during the low-rate PROBE_BW phase, until the
+        /// first loss taken in PROBE_UP drives `handle_inflight_too_high`. That is what pulls
+        /// `inflight_longterm` down from its `u64::MAX` init to a finite value; only once it is
+        /// finite does the exponential-slope machinery (`raise_inflight_long_term_slope`) have a
+        /// base to grow. The loss is switched off the instant it fires (see `loss_active`), so the
+        /// post-jump probing sees a clean, loss-free 100 Mbit/s link.
+        const LOSS_PERIOD: u64 = 25;
+
+        // Seed the probe RNG so the PROBE_BW cycle timing (hence when PROBE_UP is entered) is
+        // deterministic.
+        let seed: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let config = Bbr3Config {
+            probe_rng_seed: Some(seed),
+            ..Bbr3Config::default()
+        };
+        let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            // time this packet resolves: its ACK arrival, or (for a seeded drop) the instant its
+            // loss is detected.
+            event_ns: u64,
+            lost: bool,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        // time at which the bottleneck finishes serving everything queued so far
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // bottleneck serialization time for one MSS-sized packet; lowered 10x at the bump.
+        let mut btl_service_ns: u64 = (MSS as f64 / BW_LO * 1e9).round() as u64;
+        // The 10x jump fires once PROBE_BW has been reached AND inflight_longterm is finite (the
+        // seeding loss has set it). Only then does the exponential-slope machinery have a base.
+        let mut bumped = false;
+        // Low-rate seeding loss: off until the flow has ramped cleanly to BW_LO in PROBE_BW, then
+        // on until inflight_longterm is first set finite (so it is seeded from a healthy operating
+        // point ~BDP_LO rather than a loss-depressed one).
+        let mut loss_active = false;
+        // max_bw captured at the bump (the low-rate operating point) and the round it happened.
+        let mut bump_max_bw = 0.0f64;
+        let mut bump_round: u64 = 0;
+        // Round the first post-bump PROBE_UP began, for the O(log) discovery bound.
+        let mut first_up_round: Option<u64> = None;
+        // (inflight_longterm, bw_probe_up_rounds) at each post-bump PROBE_UP round-start.
+        let mut up_rounds: Vec<(u64, u32)> = Vec::new();
+        // PROBE_UP rounds from first probe to rediscovering the full BW_HI.
+        let mut discover_rounds: Option<u64> = None;
+
+        for _ in 0..5_000_000 {
+            let cwnd = bbr.window();
+            // Always-backlogged, paced sender: it offers data continuously and is paced at BBR's
+            // chosen rate (in PROBE_UP that is 1.25x the delivery rate, the probe that drives the
+            // bandwidth search). Whenever the congestion window — not pacing — is what stops the
+            // next send, report the cwnd-blocked signal exactly as the connection layer does.
+            let can_send = inflight + MSS <= cwnd;
+            if !can_send {
+                bbr.on_cwnd_limited();
+            }
+            let next_ack = flight.front().map(|p| p.event_ns);
+            let do_send = can_send && next_ack.is_none_or(|ev| next_send_ns <= ev);
+
+            if do_send {
+                let send_ns = now_ns.max(next_send_ns);
+                now_ns = send_ns;
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let event_ns = finish + RET_NS;
+
+                // Low-rate loss to seed a finite inflight_longterm: drop 1-in-LOSS_PERIOD only
+                // while in PROBE_BW and inflight_longterm is still unset. A drop taken in PROBE_UP
+                // runs handle_inflight_too_high, which sets inflight_longterm and stops the loss.
+                let lost = loss_active
+                    && matches!(bbr.state, BbrState::ProbeBw(_))
+                    && pn % LOSS_PERIOD == LOSS_PERIOD - 1;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    event_ns,
+                    lost,
+                });
+                // pace the next send at BBR's chosen pacing rate
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.event_ns);
+                inflight -= MSS;
+                if p.lost {
+                    bbr.on_packet_lost(MSS as u16, p.pn, at(now_ns));
+                } else {
+                    rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                    bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
+                    bbr.on_end_acks(at(now_ns), inflight, false, Some(p.pn));
+                }
+
+                // Turn the seeding loss on once cleanly ramped to BW_LO, off the instant
+                // inflight_longterm is set finite.
+                if !bumped && matches!(bbr.state, BbrState::ProbeBw(_)) && bbr.max_bw >= 0.9 * BW_LO {
+                    loss_active = true;
+                }
+                if bbr.inflight_longterm != u64::MAX {
+                    loss_active = false;
+                }
+
+                // Phase 1 -> 2: once settled in PROBE_BW at the low rate (max_bw near BW_LO) with a
+                // finite inflight_longterm (a low-rate PROBE_UP overshoot has hit the buffer), jump
+                // the link 10x. Only a finite inflight_longterm gives the exponential slope a base.
+                if !bumped
+                    && matches!(bbr.state, BbrState::ProbeBw(_))
+                    && bbr.inflight_longterm != u64::MAX
+                {
+                    bumped = true;
+                    bump_max_bw = bbr.max_bw;
+                    bump_round = bbr.round_count;
+                    up_rounds.push((bbr.inflight_longterm, bbr.bw_probe_up_rounds));
+                    btl_service_ns = (MSS as f64 / BW_HI * 1e9).round() as u64;
+                }
+
+                // Record (inflight_longterm, bw_probe_up_rounds) once per PROBE_UP round-start after
+                // the bump, and the round the first post-bump PROBE_UP began.
+                if bumped
+                    && bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Up)
+                    && bbr.round_start
+                {
+                    first_up_round.get_or_insert(bbr.round_count);
+                    up_rounds.push((bbr.inflight_longterm, bbr.bw_probe_up_rounds));
+                }
+
+                // Full BW_HI rediscovered.
+                if bumped && bbr.max_bw >= 0.97 * BW_HI {
+                    discover_rounds = Some(bbr.round_count - first_up_round.unwrap_or(bump_round));
+                    break;
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        // The flow was jumped 10x while genuinely in the low-rate regime (well below BW_HI).
+        assert!(bumped, "flow never reached PROBE_BW with a finite inflight_longterm to bump");
+        assert!(
+            bump_max_bw > 0.0 && bump_max_bw < 0.3 * BW_HI,
+            "at the bump the flow should be in the low-rate regime, got max_bw {bump_max_bw}"
+        );
+
+        // The full 100 Mbit/s was discovered, and within a small, O(log(BDP)) number of PROBE_UP
+        // round trips (BDP_HI is ~1041 packets, log2 ~= 10; the bound leaves generous headroom for
+        // constant factors and the rounds where the paced sender briefly wasn't cwnd-limited).
+        let discover_rounds = discover_rounds.expect("BBR never rediscovered the full 100 Mbit/s");
+        assert!(
+            discover_rounds <= 25,
+            "expected O(log(BDP)) PROBE_UP rounds to rediscover BW_HI, took {discover_rounds}"
+        );
+
+        // The additive step added to inflight_longterm doubles each round trip: bw_probe_up_rounds
+        // is raised once per cwnd-limited round (the `SMSS << bw_probe_up_rounds` slope), and the
+        // per-round inflight_longterm increment grows geometrically as a result.
+        let max_probe_up_rounds = up_rounds.iter().map(|&(_, r)| r).max().unwrap_or(0);
+        assert!(
+            max_probe_up_rounds >= 6,
+            "the slope should be raised each cwnd-limited round; bw_probe_up_rounds only reached {max_probe_up_rounds}"
+        );
+
+        // Per-round inflight_longterm increments (over the rounds where growth actually occurred).
+        let steps: Vec<u64> = up_rounds
+            .windows(2)
+            .map(|w| w[1].0.saturating_sub(w[0].0))
+            .filter(|&d| d > 0)
+            .collect();
+        // Find the longest run of consecutive increments that each at least ~1.6x the previous —
+        // the exponential doubling (a linear ramp would hold the step constant, ratio ~1).
+        let mut best_run = 1usize;
+        let mut run = 1usize;
+        for w in steps.windows(2) {
+            if w[1] as f64 >= 1.6 * w[0] as f64 {
+                run += 1;
+                best_run = best_run.max(run);
+            } else {
+                run = 1;
+            }
+        }
+        assert!(
+            best_run >= 4,
+            "expected a sustained per-round doubling of the inflight_longterm step, \
+             longest ~2x run was {best_run} over steps {steps:?}"
         );
     }
 }
