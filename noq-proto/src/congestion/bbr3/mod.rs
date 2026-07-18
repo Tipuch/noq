@@ -5856,24 +5856,15 @@ mod test {
                         // Once the targeted interlude has been entered, the next time
                         // we are back in STARTUP is the PROBE_RTT -> STARTUP exit.
                         if entry.is_some() && exit.is_none() {
-                            exit = Some((
-                                now_ns,
-                                bbr.state,
-                                bbr.round_count,
-                                bbr.full_bw_reached,
-                            ));
+                            exit = Some((now_ns, bbr.state, bbr.round_count, bbr.full_bw_reached));
                         }
                     }
                     BbrState::ProbeRtt => {
                         // Target only the interval-expiry interlude (>= ProbeRTTInterval),
                         // skipping the t~0 unset-stamp transient.
                         if entry.is_none() && now_ns >= PROBE_RTT_INTERVAL_SEC * 1_000_000_000 {
-                            entry = Some((
-                                now_ns,
-                                bbr.cwnd_gain,
-                                bbr.round_count,
-                                bbr.full_bw_reached,
-                            ));
+                            entry =
+                                Some((now_ns, bbr.cwnd_gain, bbr.round_count, bbr.full_bw_reached));
                         }
                         // The moment probe_rtt_done_stamp is armed inside that interlude:
                         // C.inflight has drained below the ProbeRTT cwnd cap.
@@ -5980,6 +5971,237 @@ mod test {
             bbr.state,
             BbrState::Startup,
             "BBR should be back in STARTUP after the PROBE_RTT interlude"
+        );
+    }
+
+    /// A.21 — Handling loss during PROBE_UP after `inflight_longterm` is set.
+    /// equivalent to BBRHandleInflightTooHigh:
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.2-1>
+    ///
+    /// The counterpart to A.6 (loss in PROBE_UP while application-limited, where the
+    /// `!is_app_limited` guard makes `handle_inflight_too_high` leave
+    /// `inflight_longterm` untouched) and to A.18/A.19 (loss in PROBE_UP while
+    /// `inflight_longterm` is still at its `u64::MAX` init, where the loss merely
+    /// clamps it *from infinity* to a finite value for the first time). A.21 isolates
+    /// the remaining case: a non-application-limited loss in PROBE_UP while
+    /// `inflight_longterm` is **already established finite**, so the loss actively
+    /// scales the standing long-term estimate *down* via the beta-scaled reduction
+    /// rule `inflight_longterm = max(tx_in_flight, target_inflight * BETA)`.
+    ///
+    /// Loss cannot make `inflight_longterm` finite except through a loss: in PROBE_UP
+    /// `adapt_long_term_model` short-circuits on `inflight_longterm == u64::MAX`, so
+    /// nothing raises it until a first loss (`handle_inflight_too_high`) or the
+    /// STARTUP high-loss escape seeds it. The scenario therefore runs two loss
+    /// episodes over one non-app-limited, full-window flow (bottleneck bandwidth
+    /// modest, as in A.18/A.19, so a short oldest-first loss burst trips
+    /// `is_inflight_too_high` — `lost > LOSS_THRESH * tx_in_flight`):
+    ///
+    ///  1. Establish. Reach PROBE_UP loss-free, then declare the oldest in-flight
+    ///     packets lost until the accumulated loss trips `is_inflight_too_high`.
+    ///     `handle_inflight_too_high` clamps `inflight_longterm` from `u64::MAX` to a
+    ///     finite value and moves PROBE_UP -> PROBE_DOWN. Loss injection then stops;
+    ///     this is the "established `inflight_longterm`" precondition.
+    ///  2. Ride loss-free back up. PROBE_DOWN -> (cruise) -> refill -> PROBE_UP again.
+    ///     With `inflight_longterm` now finite, `adapt_long_term_model` /
+    ///     `probe_inflight_long_term_upward` carry it forward (it only ever grows) as
+    ///     the standing long-term operating point.
+    ///  3. Deciding loss. In this second PROBE_UP, before any bandwidth plateau forms
+    ///     (`start_probe_bw_up` resets `full_bw`, and a plateau needs
+    ///     `MAX_FULL_BW_COUNT` rounds, so injecting immediately keeps `full_bw_now`
+    ///     false — `BBRIsTimeToGoDown`/`maybe_go_down` never fires), declare the
+    ///     oldest in-flight packets lost until `is_inflight_too_high` trips again.
+    ///     Because the sample is non-app-limited, `handle_inflight_too_high` runs the
+    ///     reduction and resets `inflight_longterm` to
+    ///     `max(tx_in_flight, target_inflight * BETA)` — below the established value —
+    ///     then aborts PROBE_UP straight into PROBE_DOWN.
+    ///
+    /// Asserts on the deciding loss that: `inflight_longterm` was established finite
+    /// (and, only ever growing, was still >= that value entering the loss); the
+    /// deciding sample was non-app-limited; `inflight_longterm` was reset exactly to
+    /// the beta-scaled rule `max(tx_in_flight, target_inflight * BETA)` and strictly
+    /// lower than before the loss (scaled down); the exit was loss-driven, not the
+    /// plateau path (`full_bw_now` false); and PROBE_UP aborted immediately to
+    /// PROBE_DOWN.
+    #[test]
+    fn probe_up_loss_scales_down_established_inflight_longterm() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated propagation round-trip time (100ms), matching A.18/A.19
+        const RTT_NS: u64 = 100_000_000;
+        /// bottleneck bandwidth: 10 Mbit/s in bytes/sec. Modest BDP keeps `LOSS_THRESH`
+        /// (2% of tx_in_flight) small, so a short oldest-first loss burst trips
+        /// `is_inflight_too_high`.
+        const BW: f64 = 1_250_000.0;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+
+        // Seed the probe RNG so the PROBE_BW cycle timing (hence when each PROBE_UP is
+        // entered) is deterministic.
+        let seed: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let config = Bbr3Config {
+            probe_rng_seed: Some(seed),
+            ..Bbr3Config::default()
+        };
+        let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            ack_ns: u64,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+        let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
+
+        // Episode 1: the value inflight_longterm was clamped to when the first PROBE_UP loss made it
+        // finite (from u64::MAX). Marks the "established" precondition and switches episode 1 off.
+        let mut established: Option<u64> = None;
+        // Episode 2 (deciding loss): (inflight_longterm before/after the deciding loss, the deciding
+        // sample's tx_in_flight, target_inflight = min(bdp, cwnd) at the loss, whether the sample was
+        // app-limited, full_bw_now at the edge, and the post-loss state).
+        let mut ep2: Option<(u64, u64, u64, u64, bool, bool, BbrState)> = None;
+
+        for _ in 0..5_000_000 {
+            if ep2.is_some() {
+                break;
+            }
+            let cwnd = bbr.window();
+            let can_send = inflight + MSS <= cwnd;
+            if !can_send {
+                bbr.on_cwnd_limited();
+            }
+            let next_ack = flight.front().map(|p| p.ack_ns);
+
+            let in_up = bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Up);
+            // Drop (declare oldest-first lost) whenever in PROBE_UP and the relevant episode is still
+            // pending: episode 1 while inflight_longterm is unset, episode 2 (still pending, ep2 None)
+            // on the next PROBE_UP. Between the two — any non-PROBE_UP state — delivery is loss-free,
+            // so inflight_longterm carries forward untouched and the flow rides back up to PROBE_UP.
+            let dropping = in_up && (established.is_none() || ep2.is_none());
+            let do_send = !dropping && can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                let send_ns = now_ns.max(next_send_ns);
+                now_ns = send_ns;
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let ack_ns = finish + RET_NS;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                });
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.ack_ns);
+                inflight -= MSS;
+                if dropping {
+                    // The PROBE_UP -> PROBE_DOWN transition happens inside on_packet_lost (via
+                    // handle_inflight_too_high), never on an ack, so any Up->Down move here is
+                    // attributable to this loss. inflight_longterm is only touched by the tripping
+                    // loss (non-tripping burst losses leave it unchanged), so `before` captured here
+                    // is exactly the pre-reduction value.
+                    let before = bbr.inflight_longterm;
+                    let was_up = bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Up);
+                    bbr.on_packet_lost(MSS as u16, p.pn, at(now_ns));
+                    if was_up && bbr.state != BbrState::ProbeBw(ProbeBwSubstate::Up) {
+                        if established.is_none() {
+                            // Episode 1: the first loss clamped inflight_longterm finite.
+                            established = Some(bbr.inflight_longterm);
+                        } else {
+                            // Episode 2: the deciding loss scaled the established value down. Read the
+                            // formula inputs (tx_in_flight was set to inflight_at_loss, target_inflight
+                            // = min(bdp, cwnd)) live — set_cwnd does not run inside the loss path, so
+                            // bdp/cwnd match what handle_inflight_too_high used.
+                            let txif = bbr.rs.map(|rs| rs.tx_in_flight).unwrap();
+                            let target = min(bbr.bdp, bbr.cwnd);
+                            ep2 = Some((
+                                before,
+                                bbr.inflight_longterm,
+                                txif,
+                                target,
+                                bbr.rs.is_some_and(|rs| rs.is_app_limited),
+                                bbr.full_bw_now,
+                                bbr.state,
+                            ));
+                        }
+                    }
+                } else {
+                    rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                    bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
+                    bbr.on_end_acks(at(now_ns), inflight, false, Some(p.pn));
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        let established =
+            established.expect("episode 1 never established a finite inflight_longterm");
+        let (before, after, txif, target, app_lim, full_bw_now, post_state) =
+            ep2.expect("episode 2 deciding loss never fired out of PROBE_UP");
+
+        // Precondition: inflight_longterm was established finite by episode 1, and — only ever growing
+        // between the episodes (loss-free) — was still >= that value entering the deciding loss.
+        assert!(
+            established < u64::MAX,
+            "episode 1 should have clamped inflight_longterm finite"
+        );
+        assert!(
+            before >= established && before < u64::MAX,
+            "the standing inflight_longterm entering the deciding loss should be the established \
+             finite value carried forward (before {before} vs established {established})"
+        );
+
+        // The deciding loss sample was non-application-limited, so handle_inflight_too_high runs the
+        // reduction rather than skipping it (the A.6 path).
+        assert!(
+            !app_lim,
+            "deciding loss sample should be non-application-limited so the reduction applies"
+        );
+
+        // handle_inflight_too_high reset inflight_longterm to the beta-scaled rule
+        // max(tx_in_flight, target_inflight * BETA)...
+        assert_eq!(
+            after,
+            max(txif, (target as f64 * BETA) as u64),
+            "inflight_longterm should be reset to max(tx_in_flight, target_inflight * BETA)"
+        );
+        // ...scaling the established estimate strictly down.
+        assert!(
+            after < before,
+            "inflight_longterm should be scaled down from its established value \
+             (after {after} vs before {before})"
+        );
+
+        // Loss, not the plateau path, drove the exit: the deciding loss was injected before any
+        // bandwidth plateau formed, so full_bw_now (BBRIsTimeToGoDown's signal) never got set.
+        assert!(
+            !full_bw_now,
+            "expected a loss-driven exit, but the plateau signal full_bw_now was set"
+        );
+        // PROBE_UP aborted immediately into PROBE_DOWN.
+        assert_eq!(
+            post_state,
+            BbrState::ProbeBw(ProbeBwSubstate::Down),
+            "the loss should abort PROBE_UP straight to PROBE_DOWN via handle_inflight_too_high"
         );
     }
 }
