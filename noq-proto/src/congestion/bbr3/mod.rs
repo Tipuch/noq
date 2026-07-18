@@ -5695,4 +5695,291 @@ mod test {
             "inflight_shortterm should be restored to max(current, undo) = u64::MAX"
         );
     }
+
+    /// A.20 — Entering and exiting PROBE_RTT during STARTUP.
+    /// equivalent to BBRCheckProbeRTT / BBRHandleProbeRTT / BBRExitProbeRTT:
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.4.3>
+    ///
+    /// A.10 covers the PROBE_RTT interlude that fires *after* PROBE_BW, where
+    /// `full_bw_reached` is true and `exit_probe_rtt` therefore routes on to
+    /// PROBE_BW. This is the STARTUP-phase counterpart: the periodic min-RTT
+    /// re-probe fires while the flow is *still in STARTUP* with `full_bw_reached`
+    /// false, so `exit_probe_rtt` must route back to STARTUP (`enter_startup`) to
+    /// keep searching for the max bandwidth — never forward to PROBE_BW. A.7 shows
+    /// this same STARTUP <-> PROBE_RTT oscillation as a side effect of its "never
+    /// exits STARTUP" premise; A.20 isolates and asserts the entry / duration /
+    /// exit mechanics of one such interlude.
+    ///
+    /// Extended, slow STARTUP (same construction as A.7): the app is held to a
+    /// small fixed window (`APP_WINDOW`, well below cwnd) from the first packet, so
+    /// every sample is application-limited and `check_full_bw_reached` bails on its
+    /// `is_app_limited` guard — `full_bw_reached` never arms and STARTUP persists.
+    /// With a constant RTT the min-RTT floor never drops, so `update_min_rtt`
+    /// freezes `probe_rtt_min_stamp` and flips `BBR.probe_rtt_expired` true one
+    /// `BBR.ProbeRTTInterval` (5 s) after it was last stamped; `check_probe_rtt`
+    /// then enters PROBE_RTT — all while `full_bw_reached` is still false.
+    ///
+    /// A transient PROBE_RTT also fires on the very first ack (`probe_rtt_min_stamp`
+    /// starts unset, so `probe_rtt_expired` is true at t~0); its exit re-stamps
+    /// `probe_rtt_min_stamp`, so the *next* expiry — the one this test targets —
+    /// lands a full ProbeRTTInterval later, ~5 s into the still-running STARTUP.
+    /// The t~0 transient is filtered out by requiring the entry at
+    /// >= ProbeRTTInterval.
+    ///
+    /// On entry `check_probe_rtt` runs `enter_probe_rtt` (state -> ProbeRtt,
+    /// `cwnd_gain` -> ProbeRTTCwndGain 0.5) and clears `probe_rtt_done_stamp`;
+    /// `bound_cwnd_for_probe_rtt` caps cwnd at `BBRProbeRTTCwnd` (~0.5*BDP) so the
+    /// sender stalls until `C.inflight` drains below the cap. When it does,
+    /// `handle_probe_rtt` arms `probe_rtt_done_stamp = now + ProbeRTTDuration`
+    /// (200 ms) and starts a fresh round; PROBE_RTT then holds until *both* one
+    /// packet-timed round has elapsed (`probe_rtt_round_done`) *and*
+    /// `now > probe_rtt_done_stamp`. `check_probe_rtt_done` then restores the cwnd
+    /// and calls `exit_probe_rtt`, which — `full_bw_reached` being false — runs
+    /// `enter_startup`, returning the flow to STARTUP.
+    ///
+    /// Asserts that: the flow only ever occupied STARTUP or PROBE_RTT (never
+    /// advanced to DRAIN/PROBE_BW) and `full_bw_reached` was never set; the targeted
+    /// PROBE_RTT was entered only after ProbeRTTInterval (5 s) had elapsed, with
+    /// `cwnd_gain == ProbeRTTCwndGain` (0.5) and `full_bw_reached` still false;
+    /// `probe_rtt_done_stamp` armed once inflight drained below the cap; the
+    /// interlude held for at least ProbeRTTDuration (200 ms) *and* one round after
+    /// arming; and the exit returned to STARTUP — not PROBE_BW — with
+    /// `full_bw_reached` still false.
+    #[test]
+    fn startup_enters_and_exits_probe_rtt_back_to_startup() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated bottleneck bandwidth: 100 Mbit/s in bytes/sec
+        const BW: f64 = 12_500_000.0;
+        /// simulated propagation round-trip time (100ms), matching A.7/A.10
+        const RTT_NS: u64 = 100_000_000;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+        /// bytes the app keeps outstanding, from the first packet on. Fixed and
+        /// well below cwnd so the sender is application-limited, never cwnd-limited,
+        /// keeping `full_bw_reached` false and STARTUP alive (cf. A.7). Comfortably
+        /// above `min_pipe_cwnd` (4*MSS).
+        const APP_WINDOW: u64 = 20 * MSS;
+        /// round cap (~1 RTT each, so ~12 s) — more than one ProbeRTTInterval (5 s)
+        /// plus a ProbeRTTDuration (200 ms), enough to capture the interval-expiry
+        /// interlude and its exit if the loop does not break earlier.
+        const ROUNDS_CAP: u64 = 120;
+
+        // bottleneck serialization time for one MSS-sized packet
+        let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
+
+        // Drive the production default configuration.
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            ack_ns: u64,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        // time at which the bottleneck finishes serving everything queued so far
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // Captured on the targeted PROBE_RTT entry edge (first entry at or after
+        // ProbeRTTInterval, i.e. the genuine interval-expiry interlude, not the t~0
+        // transient): (now_ns, cwnd_gain, round, full_bw_reached).
+        let mut entry: Option<(u64, f64, u64, bool)> = None;
+        // Captured when probe_rtt_done_stamp is first armed inside that interlude
+        // (C.inflight has drained below the ProbeRTT cwnd cap): (now_ns, round).
+        let mut done_armed: Option<(u64, u64)> = None;
+        // Captured on the PROBE_RTT -> STARTUP exit edge:
+        // (now_ns, state, round, full_bw_reached).
+        let mut exit: Option<(u64, BbrState, u64, bool)> = None;
+        // Set the moment any forbidden (past-STARTUP) state is entered.
+        let mut advanced_past_startup: Option<BbrState> = None;
+        // Whether full_bw_reached was ever set (must stay false throughout).
+        let mut full_bw_reached_ever = false;
+
+        for _ in 0..1_000_000 {
+            let cwnd = bbr.window();
+            // The app never wants more than APP_WINDOW outstanding.
+            let window_cap = APP_WINDOW.min(cwnd);
+            let can_send = inflight + MSS <= window_cap;
+            let next_ack = flight.front().map(|p| p.ack_ns);
+
+            // Send whenever the small app window allows and a paced send is due no
+            // later than the next ack; otherwise process an ack. The app window is
+            // always the binding limit, not cwnd (cf. A.7).
+            let do_send = can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                now_ns = now_ns.max(next_send_ns);
+                let send_ns = now_ns;
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let ack_ns = finish + RET_NS;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                });
+
+                // Emulate the connection layer's C.app_limited so the next packet is
+                // stamped app-limited at send time (same shape as A.7).
+                bbr.app_limited = pn;
+
+                // pace the next send at BBR's chosen pacing rate
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.ack_ns);
+                inflight -= MSS;
+                rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, true, &rtt_est);
+                bbr.on_end_acks(at(now_ns), inflight, true, Some(p.pn));
+
+                full_bw_reached_ever |= bbr.full_bw_reached;
+
+                match bbr.state {
+                    BbrState::Startup => {
+                        // Once the targeted interlude has been entered, the next time
+                        // we are back in STARTUP is the PROBE_RTT -> STARTUP exit.
+                        if entry.is_some() && exit.is_none() {
+                            exit = Some((
+                                now_ns,
+                                bbr.state,
+                                bbr.round_count,
+                                bbr.full_bw_reached,
+                            ));
+                        }
+                    }
+                    BbrState::ProbeRtt => {
+                        // Target only the interval-expiry interlude (>= ProbeRTTInterval),
+                        // skipping the t~0 unset-stamp transient.
+                        if entry.is_none() && now_ns >= PROBE_RTT_INTERVAL_SEC * 1_000_000_000 {
+                            entry = Some((
+                                now_ns,
+                                bbr.cwnd_gain,
+                                bbr.round_count,
+                                bbr.full_bw_reached,
+                            ));
+                        }
+                        // The moment probe_rtt_done_stamp is armed inside that interlude:
+                        // C.inflight has drained below the ProbeRTT cwnd cap.
+                        if entry.is_some()
+                            && done_armed.is_none()
+                            && bbr.probe_rtt_done_stamp.is_some()
+                        {
+                            done_armed = Some((now_ns, bbr.round_count));
+                        }
+                    }
+                    // Any other state means STARTUP was actually left for the next
+                    // phase — the failure this test guards against.
+                    other => {
+                        advanced_past_startup.get_or_insert(other);
+                    }
+                }
+
+                if advanced_past_startup.is_some()
+                    || exit.is_some()
+                    || bbr.round_count >= ROUNDS_CAP
+                {
+                    break;
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        // Never advanced past STARTUP: only STARTUP and the scheduled PROBE_RTT
+        // min-RTT refresh were ever entered.
+        assert!(
+            advanced_past_startup.is_none(),
+            "BBR left STARTUP for {:?} during the extended slow-STARTUP PROBE_RTT interlude",
+            advanced_past_startup,
+        );
+        // The plateau path never armed: check_full_bw_reached short-circuits on
+        // app-limited samples, so full_bw_reached stayed false — the precondition
+        // for PROBE_RTT routing back to STARTUP rather than on to PROBE_BW.
+        assert!(
+            !full_bw_reached_ever,
+            "full_bw_reached must never be set on application-limited samples"
+        );
+
+        // Entered PROBE_RTT, and only after ProbeRTTInterval (5 s) elapsed while
+        // still in STARTUP with full_bw_reached false.
+        let (entry_ns, entry_cwnd_gain, _entry_round, entry_full_bw) =
+            entry.expect("BBR never entered the interval-expiry PROBE_RTT during STARTUP");
+        assert!(
+            entry_ns >= PROBE_RTT_INTERVAL_SEC * 1_000_000_000,
+            "PROBE_RTT entered before ProbeRTTInterval elapsed \
+             (entry {entry_ns} ns vs interval {}s)",
+            PROBE_RTT_INTERVAL_SEC
+        );
+        assert!(
+            !entry_full_bw,
+            "full_bw_reached should be false on the STARTUP-phase PROBE_RTT entry"
+        );
+        // cwnd_gain was set to ProbeRTTCwndGain (0.5) on entry.
+        assert_eq!(
+            entry_cwnd_gain, bbr.probe_rtt_cwnd_gain,
+            "PROBE_RTT cwnd_gain should be ProbeRTTCwndGain"
+        );
+        assert_eq!(
+            entry_cwnd_gain, PROBE_RTT_CWND_GAIN,
+            "ProbeRTTCwndGain should be 0.5"
+        );
+
+        // The ProbeRTTDuration clock was armed once inflight drained below the cap.
+        let (done_ns, done_round) = done_armed.expect("PROBE_RTT never armed probe_rtt_done_stamp");
+
+        // Exited PROBE_RTT back to STARTUP (not PROBE_BW), full_bw_reached still false.
+        let (exit_ns, exit_state, exit_round, exit_full_bw) =
+            exit.expect("BBR never exited PROBE_RTT back to STARTUP");
+        assert_eq!(
+            exit_state,
+            BbrState::Startup,
+            "PROBE_RTT should exit back to STARTUP when full_bw_reached is false"
+        );
+        assert!(
+            !exit_full_bw,
+            "full_bw_reached should remain false across the PROBE_RTT -> STARTUP exit"
+        );
+
+        // Held for at least ProbeRTTDuration (200 ms) after the clock was armed
+        // (check_probe_rtt_done uses a strict `now > probe_rtt_done_stamp`)...
+        assert!(
+            exit_ns - done_ns >= PROBE_RTT_DURATION_MS * 1_000_000,
+            "PROBE_RTT exited before ProbeRTTDuration elapsed \
+             (held {} ns vs duration {} ms)",
+            exit_ns - done_ns,
+            PROBE_RTT_DURATION_MS
+        );
+        // ...and for at least one packet-timed round after arming.
+        assert!(
+            exit_round > done_round,
+            "PROBE_RTT should hold at least one round after arming \
+             (arm round {done_round} vs exit round {exit_round})"
+        );
+        // Sanity: entry preceded the exit.
+        assert!(exit_ns > entry_ns);
+
+        // Ends in STARTUP, still searching for max bandwidth.
+        assert_eq!(
+            bbr.state,
+            BbrState::Startup,
+            "BBR should be back in STARTUP after the PROBE_RTT interlude"
+        );
+    }
 }
