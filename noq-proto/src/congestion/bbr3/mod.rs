@@ -1868,8 +1868,11 @@ mod test {
                     self.btl_free_ns = finish;
                     let ack_ns = finish + self.ret_ns;
 
-                    self.bbr
-                        .on_packet_sent(self.base + Duration::from_nanos(send_ns), self.mss as u16, self.pn);
+                    self.bbr.on_packet_sent(
+                        self.base + Duration::from_nanos(send_ns),
+                        self.mss as u16,
+                        self.pn,
+                    );
                     self.inflight += self.mss;
                     self.flight.push_back(SimPacket {
                         pn: self.pn,
@@ -1890,11 +1893,14 @@ mod test {
                     self.inflight -= self.mss;
                     let now_at = self.base + Duration::from_nanos(self.now_ns);
                     let send_at = self.base + Duration::from_nanos(p.send_ns);
-                    self.rtt_est
-                        .update(Duration::ZERO, Duration::from_nanos(self.now_ns - p.send_ns));
+                    self.rtt_est.update(
+                        Duration::ZERO,
+                        Duration::from_nanos(self.now_ns - p.send_ns),
+                    );
                     self.bbr
                         .on_ack(now_at, send_at, self.mss, p.pn, false, &self.rtt_est);
-                    self.bbr.on_end_acks(now_at, self.inflight, false, Some(p.pn));
+                    self.bbr
+                        .on_end_acks(now_at, self.inflight, false, Some(p.pn));
 
                     if on_ack(&mut self.bbr, self.now_ns, self.inflight, p.pn).is_break() {
                         return;
@@ -3350,9 +3356,7 @@ mod test {
                 // unset so probe_rtt_expired is true at t=0; that one happens during
                 // STARTUP, exits straight back to STARTUP via !full_bw_reached, and
                 // is filtered out by the reached_probe_bw guard.)
-                if reached_probe_bw
-                    && probe_rtt_entry.is_none()
-                    && bbr.state == BbrState::ProbeRtt
+                if reached_probe_bw && probe_rtt_entry.is_none() && bbr.state == BbrState::ProbeRtt
                 {
                     probe_rtt_entry = Some((now_ns, bbr.cwnd_gain, bbr.round_count));
                 }
@@ -3408,8 +3412,7 @@ mod test {
         );
 
         // The ProbeRTTDuration clock was armed once inflight drained below the cap.
-        let (done_ns, done_round) =
-            done_armed.expect("PROBE_RTT never armed probe_rtt_done_stamp");
+        let (done_ns, done_round) = done_armed.expect("PROBE_RTT never armed probe_rtt_done_stamp");
 
         // Exited PROBE_RTT back to PROBE_BW (Cruise), full_bw_reached still true.
         let (exit_ns, exit_state, exit_round, exit_full_bw) =
@@ -3530,7 +3533,11 @@ mod test {
 
                 bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
                 inflight += MSS;
-                flight.push_back(InFlight { pn, send_ns, ack_ns });
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                });
 
                 let pacing = bbr.pacing_rate.max(1.0);
                 next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
@@ -3564,8 +3571,14 @@ mod test {
             bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
             bbr.on_end_acks(at(now_ns), inflight, false, Some(p.pn));
         }
-        assert_eq!(inflight, 0, "harness should have drained all in-flight data");
-        assert_eq!(bbr.inflight, 0, "C.inflight should be 0 once the app goes idle");
+        assert_eq!(
+            inflight, 0,
+            "harness should have drained all in-flight data"
+        );
+        assert_eq!(
+            bbr.inflight, 0,
+            "C.inflight should be 0 once the app goes idle"
+        );
         assert!(
             matches!(bbr.state, BbrState::ProbeBw(_)),
             "flow should still be in PROBE_BW when it goes idle, got {:?}",
@@ -3597,7 +3610,11 @@ mod test {
 
             bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
             inflight += MSS;
-            flight.push_back(InFlight { pn, send_ns, ack_ns });
+            flight.push_back(InFlight {
+                pn,
+                send_ns,
+                ack_ns,
+            });
             next_send_ns = now_ns;
             pn += 1;
         }
@@ -3630,7 +3647,11 @@ mod test {
 
                 bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
                 inflight += MSS;
-                flight.push_back(InFlight { pn, send_ns, ack_ns });
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                });
 
                 let pacing = bbr.pacing_rate.max(1.0);
                 next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
@@ -3789,7 +3810,11 @@ mod test {
 
                 bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
                 inflight += MSS;
-                flight.push_back(InFlight { pn, send_ns, ack_ns });
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                });
 
                 // pace the next send at BBR's chosen pacing rate
                 let pacing = bbr.pacing_rate.max(1.0);
@@ -4009,7 +4034,11 @@ mod test {
 
                 bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
                 inflight += MSS;
-                flight.push_back(InFlight { pn, send_ns, ack_ns });
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                });
 
                 // pace the next send at BBR's chosen pacing rate
                 let pacing = bbr.pacing_rate.max(1.0);
@@ -4089,8 +4118,7 @@ mod test {
         }
 
         // The flow reached PROBE_CRUISE and we gathered acks there.
-        let cruise_start_round =
-            cruise_start_round.expect("flow never reached PROBE_CRUISE");
+        let cruise_start_round = cruise_start_round.expect("flow never reached PROBE_CRUISE");
         assert!(
             !cruise_samples.is_empty(),
             "no acks gathered in PROBE_CRUISE"
@@ -4321,7 +4349,11 @@ mod test {
 
                 bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
                 inflight += MSS;
-                flight.push_back(InFlight { pn, send_ns, ack_ns });
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                });
 
                 // pace the next send at BBR's chosen pacing rate
                 let pacing = bbr.pacing_rate.max(1.0);
@@ -4410,11 +4442,7 @@ mod test {
             cwnd_gain * bdp as f64
         );
         // MinPipeCwnd is 4 * SMSS.
-        assert_eq!(
-            min_pipe_cwnd,
-            4 * MSS,
-            "MinPipeCwnd should be 4 packets"
-        );
+        assert_eq!(min_pipe_cwnd, 4 * MSS, "MinPipeCwnd should be 4 packets");
         // The floor, not the tiny model budget, governs C.cwnd.
         assert_eq!(
             cwnd, min_pipe_cwnd,
@@ -4616,7 +4644,8 @@ mod test {
 
                 // Turn the seeding loss on once cleanly ramped to BW_LO, off the instant
                 // inflight_longterm is set finite.
-                if !bumped && matches!(bbr.state, BbrState::ProbeBw(_)) && bbr.max_bw >= 0.9 * BW_LO {
+                if !bumped && matches!(bbr.state, BbrState::ProbeBw(_)) && bbr.max_bw >= 0.9 * BW_LO
+                {
                     loss_active = true;
                 }
                 if bbr.inflight_longterm != u64::MAX {
@@ -4639,9 +4668,7 @@ mod test {
 
                 // Record (inflight_longterm, bw_probe_up_rounds) once per PROBE_UP round-start after
                 // the bump, and the round the first post-bump PROBE_UP began.
-                if bumped
-                    && bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Up)
-                    && bbr.round_start
+                if bumped && bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Up) && bbr.round_start
                 {
                     first_up_round.get_or_insert(bbr.round_count);
                     up_rounds.push((bbr.inflight_longterm, bbr.bw_probe_up_rounds));
@@ -4658,7 +4685,10 @@ mod test {
         }
 
         // The flow was jumped 10x while genuinely in the low-rate regime (well below BW_HI).
-        assert!(bumped, "flow never reached PROBE_BW with a finite inflight_longterm to bump");
+        assert!(
+            bumped,
+            "flow never reached PROBE_BW with a finite inflight_longterm to bump"
+        );
         assert!(
             bump_max_bw > 0.0 && bump_max_bw < 0.3 * BW_HI,
             "at the bump the flow should be in the low-rate regime, got max_bw {bump_max_bw}"
@@ -4704,6 +4734,220 @@ mod test {
             best_run >= 4,
             "expected a sustained per-round doubling of the inflight_longterm step, \
              longest ~2x run was {best_run} over steps {steps:?}"
+        );
+    }
+
+    /// A.16 — Decreasing bandwidth 10x and ensuring max bandwidth adapts down.
+    /// Exercises the short-term loss response (`loss_lower_bounds`) and the windowed `max_bw`
+    /// filter expiry (`advance_max_bw_filter`, `BBR.MaxBwFilterLen`):
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-2.10>
+    ///
+    /// After PROBE_BW is reached at a high link rate, the bottleneck bandwidth drops 10x. The
+    /// flow is still carrying ~BDP of the *old* (high) rate, so once the link slows the standing
+    /// queue overflows the bottleneck buffer and packets are lost. Two things must happen:
+    ///
+    ///  1. The short-term model reacts within the current probe cycle. A loss round runs
+    ///     `loss_lower_bounds`, decaying `BBR.bw_shortterm` by `BETA` (0.7) toward the freshly
+    ///     measured `bw_latest`. Because `bw = min(max_bw, bw_shortterm)`, this throttles
+    ///     pacing/cwnd immediately — long before the long-term `max_bw` moves. (Each PROBE_BW
+    ///     refill resets `bw_shortterm` and re-seeds it from the still-stale-high `max_bw`, so per
+    ///     cycle it only steps down ~one `BETA`; the full collapse to the new rate is the filter's
+    ///     job, below.)
+    ///  2. The long-term `max_bw` is a max filter over `RS.delivery_rate` keyed on `cycle_count`
+    ///     with a window of `MAX_BW_FILTER_LEN` (2). The stale high sample only expires once
+    ///     `cycle_count` has advanced past the window — i.e. after ~2 PROBE_BW cycles
+    ///     (`advance_max_bw_filter` ticks once per cycle at `ProbeStopping`). Then `get_max()`
+    ///     returns the recent ~low-rate samples and `max_bw` drops to the new 10 Mbit/s limit.
+    ///
+    /// Same bespoke single-bottleneck FIFO loop as A.15 (bandwidth changes mid-flight, which the
+    /// shared `Sim` can't express), inverted: start at 100 Mbit/s, then cut to 10 Mbit/s. A finite
+    /// bottleneck buffer (~1 BDP of the high rate) makes the 10x cut produce real tail-drop loss —
+    /// the flow runs cleanly at 100 Mbit/s but overflows the moment the link slows.
+    ///  1. `BW_HI` = 100 Mbit/s. Ramp cleanly into PROBE_BW with `max_bw` ~= `BW_HI`.
+    ///  2. Cut the bottleneck rate 10x (`BW_LO` = 10 Mbit/s). The overflowing queue drives loss;
+    ///     track the minimum `bw_shortterm` seen afterwards and the `cycle_count` at which `max_bw`
+    ///     first collapses to the new rate.
+    ///
+    /// Asserts:
+    ///  - at the cut the flow was in the high-rate regime (`max_bw` ~= `BW_HI`);
+    ///  - `bw_shortterm` adapts down rapidly after the cut — its post-cut minimum falls at least one
+    ///    `BETA` step below `BW_HI`, throttling the flow within the cycle;
+    ///  - `max_bw` collapses to the new `BW_LO` (within ~15%) once the filter window expires, and
+    ///    does so within a small number of PROBE_BW cycles (`MAX_BW_FILTER_LEN` + headroom).
+    #[test]
+    fn max_bw_adapts_down_after_10x_decrease() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated propagation round-trip time (100ms), matching A.1
+        const RTT_NS: u64 = 100_000_000;
+        /// high link rate before the cut: 100 Mbit/s in bytes/sec
+        const BW_HI: f64 = 12_500_000.0;
+        /// low link rate after the cut: 10 Mbit/s in bytes/sec (1/10th)
+        const BW_LO: f64 = 1_250_000.0;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+        /// bottleneck buffer, in bytes. Sized at ~1 BDP of the high rate so the 100 Mbit/s flow
+        /// runs loss-free (BBR holds ~1 BDP inflight with only a small standing queue), but the
+        /// instant the rate is cut 10x the ~1 BDP still in flight drains at a tenth the rate — the
+        /// queue overflows this buffer and packets are tail-dropped. That loss is the signal that
+        /// drives `bw_shortterm` down and, once the max-bw filter window expires, `max_bw`.
+        const BUFFER_BYTES: f64 = BW_HI * (RTT_NS as f64 / 1e9);
+
+        // Seed the probe RNG so the PROBE_BW cycle timing is deterministic.
+        let seed: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let config = Bbr3Config {
+            probe_rng_seed: Some(seed),
+            ..Bbr3Config::default()
+        };
+        let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            // time this packet resolves: its ACK arrival, or (for a tail drop) the instant its
+            // loss is detected.
+            event_ns: u64,
+            lost: bool,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        // time at which the bottleneck finishes serving everything queued so far
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // bottleneck serialization time for one MSS-sized packet; raised 10x at the cut.
+        let mut btl_service_ns: u64 = (MSS as f64 / BW_HI * 1e9).round() as u64;
+        // The 10x cut fires once PROBE_BW has been reached at the high rate (max_bw ~= BW_HI).
+        let mut cut = false;
+        // max_bw / cycle_count captured at the cut (the high-rate operating point).
+        let mut cut_max_bw = 0.0f64;
+        let mut cut_cycle: u64 = 0;
+        // Minimum finite bw_shortterm seen after the cut — the short-term model's rapid descent.
+        let mut min_shortterm_after = f64::INFINITY;
+        // PROBE_BW cycles (cycle_count advances) elapsed when max_bw first collapses to ~BW_LO.
+        let mut adapt_cycles: Option<u64> = None;
+
+        for _ in 0..5_000_000 {
+            let cwnd = bbr.window();
+            // Always-backlogged, paced sender, as in A.15. Report the cwnd-blocked signal exactly
+            // as the connection layer does whenever the window (not pacing) stops the next send.
+            let can_send = inflight + MSS <= cwnd;
+            if !can_send {
+                bbr.on_cwnd_limited();
+            }
+            let next_ack = flight.front().map(|p| p.event_ns);
+            let do_send = can_send && next_ack.is_none_or(|ev| next_send_ns <= ev);
+
+            if do_send {
+                let send_ns = now_ns.max(next_send_ns);
+                now_ns = send_ns;
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                // Bytes already queued behind the bottleneck when this packet arrives. A tail drop
+                // occurs if the standing queue already exceeds the buffer.
+                let queue_bytes = service_start.saturating_sub(arrival) as f64
+                    / btl_service_ns as f64
+                    * MSS as f64;
+                let lost = queue_bytes > BUFFER_BYTES;
+
+                let event_ns = if lost {
+                    // Dropped: never served, so the bottleneck is not advanced. Its loss is detected
+                    // roughly when the packets around it would have been served/acked.
+                    service_start + RET_NS
+                } else {
+                    let finish = service_start + btl_service_ns;
+                    btl_free_ns = finish;
+                    finish + RET_NS
+                };
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    event_ns,
+                    lost,
+                });
+                // pace the next send at BBR's chosen pacing rate
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.event_ns);
+                inflight -= MSS;
+                if p.lost {
+                    bbr.on_packet_lost(MSS as u16, p.pn, at(now_ns));
+                } else {
+                    rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                    bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
+                    bbr.on_end_acks(at(now_ns), inflight, false, Some(p.pn));
+                }
+
+                // Phase 1 -> 2: once settled in PROBE_BW at the high rate (max_bw ~= BW_HI), cut the
+                // link 10x. The ~1 BDP still in flight now overflows the buffer -> loss.
+                if !cut && matches!(bbr.state, BbrState::ProbeBw(_)) && bbr.max_bw >= 0.9 * BW_HI {
+                    cut = true;
+                    cut_max_bw = bbr.max_bw;
+                    cut_cycle = bbr.cycle_count;
+                    btl_service_ns = (MSS as f64 / BW_LO * 1e9).round() as u64;
+                }
+
+                // After the cut, watch the short-term model descend and the long-term filter expire.
+                if cut {
+                    if bbr.bw_shortterm.is_finite() {
+                        min_shortterm_after = min_shortterm_after.min(bbr.bw_shortterm);
+                    }
+                    // max_bw collapses to the new rate once the stale high sample ages out of the
+                    // MAX_BW_FILTER_LEN-wide window (keyed on cycle_count).
+                    if adapt_cycles.is_none() && bbr.max_bw <= 1.15 * BW_LO {
+                        adapt_cycles = Some(bbr.cycle_count - cut_cycle);
+                        break;
+                    }
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        // The link was cut 10x while genuinely in the high-rate regime (max_bw ~= BW_HI).
+        assert!(cut, "flow never reached PROBE_BW at the high rate to cut");
+        assert!(
+            cut_max_bw >= 0.9 * BW_HI,
+            "at the cut the flow should be in the high-rate regime, got max_bw {cut_max_bw}"
+        );
+
+        // The short-term model reacted to the loss immediately: bw_shortterm was pulled below the
+        // high operating point by at least one BETA (0.7) decay of loss_lower_bounds. This is the
+        // *rapid* response — `bw = min(max_bw, bw_shortterm)` so this throttles sending within the
+        // current cycle, long before max_bw moves. It only steps down ~one BETA per cycle because
+        // each PROBE_BW refill resets bw_shortterm to INFINITY and re-seeds it from the (still
+        // stale-high) max_bw; the deep collapse all the way to BW_LO is delivered by the max_bw
+        // filter expiry below, not by bw_shortterm alone.
+        assert!(
+            min_shortterm_after <= 0.75 * BW_HI,
+            "bw_shortterm should adapt down (>=1 BETA step) after the cut; min seen {min_shortterm_after}"
+        );
+
+        // max_bw collapsed to the new 10 Mbit/s limit (matching the path delivery rate) once the
+        // filter window expired — and within a small number of PROBE_BW cycles (MAX_BW_FILTER_LEN
+        // is 2; the bound leaves headroom for the cycle in which the cut was recorded).
+        let adapt_cycles = adapt_cycles.expect("max_bw never collapsed to the new BW_LO");
+        assert!(
+            adapt_cycles <= (MAX_BW_FILTER_LEN as u64) + 2,
+            "expected max_bw to adapt within ~MAX_BW_FILTER_LEN PROBE_BW cycles, took {adapt_cycles}"
+        );
+        assert!(
+            bbr.max_bw >= 0.85 * BW_LO && bbr.max_bw <= 1.15 * BW_LO,
+            "max_bw should track the new path delivery rate BW_LO, got {}",
+            bbr.max_bw
         );
     }
 }
