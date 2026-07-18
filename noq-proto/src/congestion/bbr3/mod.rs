@@ -5169,4 +5169,263 @@ mod test {
             "policer loss should settle to a low rate, got {loss_rate}"
         );
     }
+
+    /// A.18 — Handling spurious Fast Recovery (the loss-undo path).
+    /// Exercises `save_state_upon_loss` (BBRSaveStateUponLoss) and `on_spurious_congestion_event`
+    /// (BBRHandleSpuriousLossDetection):
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.11>
+    ///
+    /// Packet reordering — later packets delivered while earlier ones sit apparently missing — makes
+    /// the transport's loss detector declare a Fast Recovery that never really happened: the "lost"
+    /// packets were only reordered, and arrive (or are DSACK'd) shortly after. BBR guards against this
+    /// by snapshotting the pre-loss model on every declared loss (`note_loss` -> `save_state_upon_loss`)
+    /// and restoring it if the transport later reports the episode spurious (in QUIC, the original
+    /// packet's delivery is confirmed by packet number / a DSACK-equivalent, so the retransmission was
+    /// spurious). The connection layer signals this via `Controller::on_spurious_congestion_event`.
+    ///
+    /// The reordering is introduced while the flow is in PROBE_UP:
+    ///  1. Reach PROBE_UP loss-free, so the short-term model is at its reset sentinels
+    ///     (`bw_shortterm` = +inf, `inflight_shortterm` = u64::MAX) and `inflight_longterm` is still
+    ///     u64::MAX (only a loss makes it finite). Snapshot those.
+    ///  2. Declare the oldest still-in-flight packets lost — a reordering picture: later packets are
+    ///     being delivered while these earlier ones look missing. Feed them one at a time until the
+    ///     accumulated loss trips `is_inflight_too_high` (> `LOSS_THRESH` of tx_in_flight): that runs
+    ///     `handle_inflight_too_high`, which clamps `inflight_longterm` to a finite value and moves
+    ///     PROBE_UP -> PROBE_DOWN. Stop declaring losses the instant the state leaves PROBE_UP, so the
+    ///     last `note_loss` (which runs before the transition inside the same call) saved
+    ///     `undo_state` = PROBE_UP.
+    ///  3. The transport detects the loss was spurious -> `on_spurious_congestion_event`.
+    ///
+    /// Asserts:
+    ///  - `save_state_upon_loss` captured the pre-loss PROBE_UP model into the undo fields:
+    ///    `undo_state` = PROBE_UP, `undo_bw_shortterm` = +inf, `undo_inflight_shortterm` = u64::MAX,
+    ///    `undo_inflight_longterm` = u64::MAX.
+    ///  - the spurious Fast Recovery actually moved the flow off PROBE_UP and clamped
+    ///    `inflight_longterm` finite.
+    ///  - `on_spurious_congestion_event` restored the saved model — `bw_shortterm`/`inflight_shortterm`
+    ///    to `max(current, undo)` (their +inf/u64::MAX sentinels) and `inflight_longterm` back to
+    ///    u64::MAX — and seamlessly returned the flow to its previous state, PROBE_UP.
+    ///
+    /// Note on the short-term fields: for a spurious episode that restores to PROBE_UP they are
+    /// necessarily at their sentinels. `adapt_lower_bounds_from_congestion` skips PROBE_UP, so no
+    /// loss taken in PROBE_UP moves them; and any loss taken *after* the PROBE_UP -> PROBE_DOWN
+    /// transition would re-run `note_loss` and overwrite `undo_state` to PROBE_DOWN (losing the
+    /// return-to-PROBE_UP). So the meaningful restored quantities here are `inflight_longterm` and the
+    /// state; the short-term fields are verified saved and restored at their reset sentinels.
+    #[test]
+    fn probe_up_restores_state_on_spurious_loss_detection() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated propagation round-trip time (100ms), matching A.1
+        const RTT_NS: u64 = 100_000_000;
+        /// bottleneck bandwidth: 10 Mbit/s in bytes/sec. Modest BDP keeps `LOSS_THRESH` (2% of
+        /// tx_in_flight) small, so a short reordering burst trips `is_inflight_too_high`.
+        const BW: f64 = 1_250_000.0;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+
+        // Seed the probe RNG so the PROBE_BW cycle timing (hence when PROBE_UP is entered) is
+        // deterministic.
+        let seed: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let config = Bbr3Config {
+            probe_rng_seed: Some(seed),
+            ..Bbr3Config::default()
+        };
+        let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            ack_ns: u64,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        // time at which the bottleneck finishes serving everything queued so far
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+        let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
+
+        // Pre-loss PROBE_UP snapshot (state, bw_shortterm, inflight_shortterm, inflight_longterm),
+        // taken the first time the flow is in PROBE_UP, before any reordering is introduced.
+        let mut pre: Option<(BbrState, f64, u64, u64)> = None;
+        // Set once the reordering-induced loss has moved the flow off PROBE_UP; carries the
+        // (undo snapshot, post-loss state, post-loss inflight_longterm) for the assertions below.
+        let mut episode: Option<((BbrState, f64, u64, u64), BbrState, u64)> = None;
+
+        for _ in 0..5_000_000 {
+            if episode.is_some() {
+                break;
+            }
+            let cwnd = bbr.window();
+            // Always-backlogged, paced sender (as in A.15/A.16/A.17): report the cwnd-blocked signal
+            // exactly as the connection layer does whenever the window (not pacing) stops the send.
+            let can_send = inflight + MSS <= cwnd;
+            if !can_send {
+                bbr.on_cwnd_limited();
+            }
+            let next_ack = flight.front().map(|p| p.ack_ns);
+            // Once in PROBE_UP we stop sending and drain the reordering burst out of the queue, so a
+            // send is only due while we have not yet snapshotted PROBE_UP.
+            let do_send =
+                pre.is_none() && can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                let send_ns = now_ns.max(next_send_ns);
+                now_ns = send_ns;
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let ack_ns = finish + RET_NS;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                });
+                // pace the next send at BBR's chosen pacing rate
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+
+                // First time in PROBE_UP: snapshot the pre-loss model, then stop sending and begin
+                // introducing reordering on the packets already in flight.
+                if pre.is_none() && bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Up) {
+                    pre = Some((
+                        bbr.state,
+                        bbr.bw_shortterm,
+                        bbr.inflight_shortterm,
+                        bbr.inflight_longterm,
+                    ));
+                }
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.ack_ns);
+                inflight -= MSS;
+
+                // Before PROBE_UP: normal delivery, ramping the flow up.
+                // In PROBE_UP: introduce reordering by declaring the oldest still-in-flight packets
+                // lost (later packets are being delivered while these look missing). Keep declaring
+                // until the accumulated loss trips is_inflight_too_high and the flow leaves PROBE_UP;
+                // these declarations are spurious — the packets were only reordered.
+                let reordering =
+                    pre.is_some() && bbr.state == BbrState::ProbeBw(ProbeBwSubstate::Up);
+                if reordering {
+                    bbr.on_packet_lost(MSS as u16, p.pn, at(now_ns));
+
+                    // The moment handle_inflight_too_high moved us off PROBE_UP, record the episode:
+                    // the undo snapshot save_state_upon_loss captured on this loss, plus the post-loss
+                    // state and inflight_longterm. The last note_loss ran while still in PROBE_UP, so
+                    // undo_state is PROBE_UP.
+                    if bbr.state != BbrState::ProbeBw(ProbeBwSubstate::Up) {
+                        episode = Some((
+                            (
+                                bbr.undo_state,
+                                bbr.undo_bw_shortterm,
+                                bbr.undo_inflight_shortterm,
+                                bbr.undo_inflight_longterm,
+                            ),
+                            bbr.state,
+                            bbr.inflight_longterm,
+                        ));
+                    }
+                } else {
+                    rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                    bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
+                    bbr.on_end_acks(at(now_ns), inflight, false, Some(p.pn));
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        let (pre_state, pre_bw_st, pre_inflight_st, pre_inflight_lt) =
+            pre.expect("flow never reached PROBE_UP");
+        let ((undo_state, undo_bw_st, undo_inflight_st, undo_inflight_lt), post_state, post_lt) =
+            episode.expect("reordering never triggered a Fast Recovery out of PROBE_UP");
+
+        // The pre-loss PROBE_UP model was at its reset sentinels (loss-free ramp).
+        assert_eq!(pre_state, BbrState::ProbeBw(ProbeBwSubstate::Up));
+        assert_eq!(
+            pre_bw_st,
+            f64::INFINITY,
+            "bw_shortterm should be at its reset sentinel entering PROBE_UP"
+        );
+        assert_eq!(
+            pre_inflight_st,
+            u64::MAX,
+            "inflight_shortterm should be at its reset sentinel entering PROBE_UP"
+        );
+        assert_eq!(
+            pre_inflight_lt,
+            u64::MAX,
+            "inflight_longterm should still be unset (u64::MAX) before any loss"
+        );
+
+        // save_state_upon_loss captured the pre-loss PROBE_UP model into the undo fields.
+        assert_eq!(
+            undo_state,
+            BbrState::ProbeBw(ProbeBwSubstate::Up),
+            "save_state_upon_loss should have saved BBR.state = PROBE_UP"
+        );
+        assert_eq!(
+            undo_bw_st, pre_bw_st,
+            "save_state_upon_loss should have saved BBR.bw_shortterm"
+        );
+        assert_eq!(
+            undo_inflight_st, pre_inflight_st,
+            "save_state_upon_loss should have saved BBR.inflight_shortterm to undo_inflight_shortterm"
+        );
+        assert_eq!(
+            undo_inflight_lt, pre_inflight_lt,
+            "save_state_upon_loss should have saved BBR.inflight_longterm to undo_inflight_longterm"
+        );
+
+        // The spurious Fast Recovery actually moved the flow off PROBE_UP (into PROBE_DOWN) and
+        // clamped inflight_longterm to a finite value.
+        assert_eq!(
+            post_state,
+            BbrState::ProbeBw(ProbeBwSubstate::Down),
+            "the loss should drive PROBE_UP -> PROBE_DOWN via handle_inflight_too_high"
+        );
+        assert!(
+            post_lt < u64::MAX,
+            "handle_inflight_too_high should clamp inflight_longterm finite, got u64::MAX"
+        );
+
+        // The transport detects the loss was spurious (original packet delivered; the Fast Recovery
+        // should never have happened) and reports it.
+        bbr.on_spurious_congestion_event();
+
+        // on_spurious_congestion_event restored the saved model and returned to PROBE_UP.
+        assert_eq!(
+            bbr.state,
+            BbrState::ProbeBw(ProbeBwSubstate::Up),
+            "on_spurious_congestion_event should seamlessly return the flow to PROBE_UP"
+        );
+        assert_eq!(
+            bbr.inflight_longterm,
+            u64::MAX,
+            "inflight_longterm should be restored to max(current, undo) = u64::MAX"
+        );
+        assert_eq!(
+            bbr.bw_shortterm,
+            f64::INFINITY,
+            "bw_shortterm should be restored to max(current, undo) = +inf"
+        );
+        assert_eq!(
+            bbr.inflight_shortterm,
+            u64::MAX,
+            "inflight_shortterm should be restored to max(current, undo) = u64::MAX"
+        );
+    }
 }
