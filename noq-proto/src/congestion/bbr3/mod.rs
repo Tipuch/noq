@@ -4950,4 +4950,223 @@ mod test {
             bbr.max_bw
         );
     }
+
+    /// A.17 — Handling token bucket policers.
+    /// Exercises the short-term loss response (`init_lower_bounds` + `loss_lower_bounds`, driven from
+    /// `adapt_lower_bounds_from_congestion`) settling the flow to a token-bucket policer's token rate:
+    /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.10.3-8>
+    ///
+    /// A token-bucket policer is not a queue. It holds a bucket of `BURST` bytes that refills at the
+    /// token rate, admits a packet only if a token is available, and *drops* (never buffers) any
+    /// packet that arrives with the bucket empty. This is the classic BBR failure mode: during the
+    /// initial burst every packet passes at line rate, so BBR's `max_bw` filter latches onto a
+    /// delivery rate well above the token rate; once the burst is spent the policer starts dropping,
+    /// and — because the policer adds no delay, so RTT never grows and there is no queueing signal —
+    /// only the short-term model's loss response can pull the flow back down to the token rate.
+    ///
+    ///  1. The short-term model reacts within the PROBE_BW cruise/down cycle. A loss round there runs
+    ///     `init_lower_bounds` (seeding `bw_shortterm`/`inflight_shortterm` finite from the current
+    ///     `max_bw`/`cwnd`) then `loss_lower_bounds`, decaying `bw_shortterm` by `BETA` toward the
+    ///     measured `bw_latest` and `inflight_shortterm` by `BETA` toward `inflight_latest`. Because
+    ///     `bw = min(max_bw, bw_shortterm)` and the window is capped at `inflight_shortterm`, this
+    ///     throttles pacing and inflight even though the stale-high `max_bw` never moves.
+    ///  2. Repeated across cycles the short-term bounds settle the flow so its send rate matches the
+    ///     token rate: the bucket stays near empty but drops become rare rather than continuous.
+    ///
+    /// Bespoke single-bottleneck loop in the spirit of A.15/A.16, with the FIFO buffer replaced by a
+    /// token bucket (refill at `TOKEN_RATE`, cap `BURST`, no queue). A packet passes iff a token is
+    /// available on arrival, otherwise it is dropped with only propagation delay — no serialization,
+    /// no queueing, so RTT is constant and loss is the only congestion signal. Run for a fixed
+    /// simulated duration; the last `WINDOW_NS` is the stable-point measurement window.
+    ///
+    /// Asserts:
+    ///  - the flow reaches PROBE_BW (past STARTUP) with a burst-inflated `max_bw` above the token rate;
+    ///  - once the burst is exhausted and the policer drops, the short-term model engages —
+    ///    `bw_shortterm` drops below the stale-high `max_bw` and `inflight_shortterm` becomes finite;
+    ///  - the flow settles to a stable operating point conforming to the token rate: over the late
+    ///    window the delivered goodput tracks `TOKEN_RATE` and the loss rate stays low (no excessive
+    ///    continuous loss).
+    #[test]
+    fn probe_bw_settles_to_token_rate_under_policer() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated propagation round-trip time (100ms), matching A.1
+        const RTT_NS: u64 = 100_000_000;
+        /// policer token (fill) rate: 10 Mbit/s in bytes/sec
+        const TOKEN_RATE: f64 = 1_250_000.0;
+        /// initial (and maximum) bucket depth in bytes. ~2 BDP of the token rate: big enough that
+        /// STARTUP's ramp passes cleanly (the flow reaches PROBE_BW with a healthy, burst-inflated
+        /// bw estimate), small enough that continued over-sending in PROBE_BW spends it and exposes
+        /// the policer.
+        const BURST: f64 = 2.0 * TOKEN_RATE * (RTT_NS as f64 / 1e9);
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+        /// total simulated time and the trailing stable-point measurement window.
+        const TOTAL_NS: u64 = 20_000_000_000;
+        const WINDOW_NS: u64 = 5_000_000_000;
+
+        // Seed the probe RNG so the PROBE_BW cycle timing is deterministic.
+        let seed: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let config = Bbr3Config {
+            probe_rng_seed: Some(seed),
+            ..Bbr3Config::default()
+        };
+        let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            // time this packet resolves: its ACK arrival, or (for a policed drop) the instant its
+            // loss is detected.
+            event_ns: u64,
+            lost: bool,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // Token bucket: starts full, refills at TOKEN_RATE up to BURST, drained MSS per admitted
+        // packet. Advanced by packet arrival time (send_ns + FWD_NS), which is monotonic in send_ns.
+        let mut tokens: f64 = BURST;
+        let mut last_refill_ns: u64 = 0;
+
+        let mut reached_probe_bw = false;
+        // max_bw captured when PROBE_BW is first reached (the burst-inflated operating point).
+        let mut max_bw_at_probe_bw = 0.0f64;
+        // short-term model signals after the burst first drives loss in PROBE_BW.
+        let mut min_shortterm_after = f64::INFINITY;
+        let mut inflight_shortterm_engaged = false;
+
+        // late-window goodput/loss accounting.
+        let mut win_start_ns: Option<u64> = None;
+        let mut win_last_ns: u64 = 0;
+        let mut win_acked: u64 = 0;
+        let mut win_lost: u64 = 0;
+
+        for _ in 0..50_000_000 {
+            if now_ns >= TOTAL_NS {
+                break;
+            }
+            let cwnd = bbr.window();
+            // Always-backlogged, paced sender, as in A.15/A.16. Report the cwnd-blocked signal
+            // exactly as the connection layer does whenever the window (not pacing) stops the send.
+            let can_send = inflight + MSS <= cwnd;
+            if !can_send {
+                bbr.on_cwnd_limited();
+            }
+            let next_ack = flight.front().map(|p| p.event_ns);
+            let do_send = can_send && next_ack.is_none_or(|ev| next_send_ns <= ev);
+
+            if do_send {
+                let send_ns = now_ns.max(next_send_ns);
+                now_ns = send_ns;
+                let arrival = send_ns + FWD_NS;
+
+                // Refill the bucket up to its arrival time, cap at BURST, then admit-or-drop.
+                tokens = (tokens + TOKEN_RATE * (arrival - last_refill_ns) as f64 / 1e9).min(BURST);
+                last_refill_ns = arrival;
+                let lost = tokens < MSS as f64;
+                if !lost {
+                    tokens -= MSS as f64;
+                }
+                // Policer adds no queueing/serialization delay: passed packets are acked, dropped
+                // packets are detected, purely after propagation.
+                let event_ns = arrival + RET_NS;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    event_ns,
+                    lost,
+                });
+                // pace the next send at BBR's chosen pacing rate
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.event_ns);
+                inflight -= MSS;
+                if p.lost {
+                    bbr.on_packet_lost(MSS as u16, p.pn, at(now_ns));
+                } else {
+                    rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+                    bbr.on_ack(at(now_ns), at(p.send_ns), MSS, p.pn, false, &rtt_est);
+                    bbr.on_end_acks(at(now_ns), inflight, false, Some(p.pn));
+                }
+
+                if !reached_probe_bw && matches!(bbr.state, BbrState::ProbeBw(_)) {
+                    reached_probe_bw = true;
+                    max_bw_at_probe_bw = bbr.max_bw;
+                }
+                // After PROBE_BW, watch the short-term model react to the policer's drops.
+                if reached_probe_bw {
+                    if bbr.bw_shortterm.is_finite() {
+                        min_shortterm_after = min_shortterm_after.min(bbr.bw_shortterm);
+                    }
+                    if bbr.inflight_shortterm != u64::MAX {
+                        inflight_shortterm_engaged = true;
+                    }
+                }
+
+                // Late-window goodput/loss accounting.
+                if now_ns >= TOTAL_NS - WINDOW_NS {
+                    win_start_ns.get_or_insert(now_ns);
+                    win_last_ns = now_ns;
+                    if p.lost {
+                        win_lost += MSS;
+                    } else {
+                        win_acked += MSS;
+                    }
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        let win_start = win_start_ns.expect("no packets resolved in the measurement window");
+        let win_secs = (win_last_ns - win_start) as f64 / 1e9;
+        let goodput = win_acked as f64 / win_secs.max(1e-9);
+        let loss_rate = win_lost as f64 / (win_acked + win_lost).max(1) as f64;
+
+        // The flow reached PROBE_BW past STARTUP, with a burst-inflated max_bw above the token rate.
+        assert!(reached_probe_bw, "flow never reached PROBE_BW");
+        assert!(
+            max_bw_at_probe_bw > TOKEN_RATE,
+            "the burst should inflate max_bw above the token rate on reaching PROBE_BW, got {max_bw_at_probe_bw}"
+        );
+
+        // The short-term model engaged on the policer's drops: bw_shortterm fell below the stale-high
+        // max_bw (throttling via bw = min(max_bw, bw_shortterm)), and inflight_shortterm went finite
+        // (capping the window).
+        assert!(
+            min_shortterm_after < max_bw_at_probe_bw,
+            "bw_shortterm should drop below the stale-high max_bw {max_bw_at_probe_bw}, got {min_shortterm_after}"
+        );
+        assert!(
+            inflight_shortterm_engaged,
+            "inflight_shortterm should become finite when the policer drops packets"
+        );
+
+        // Stable operating point conforming to the token rate: goodput tracks TOKEN_RATE and the
+        // late-window loss rate is low (no excessive continuous loss).
+        assert!(
+            goodput >= 0.75 * TOKEN_RATE && goodput <= 1.25 * TOKEN_RATE,
+            "late-window goodput should track the token rate, got {goodput} ({:.2}x)",
+            goodput / TOKEN_RATE
+        );
+        assert!(
+            loss_rate <= 0.10,
+            "policer loss should settle to a low rate, got {loss_rate}"
+        );
+    }
 }
