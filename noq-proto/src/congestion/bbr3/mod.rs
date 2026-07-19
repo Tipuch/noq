@@ -6204,4 +6204,299 @@ mod test {
             "the loss should abort PROBE_UP straight to PROBE_DOWN via handle_inflight_too_high"
         );
     }
+
+    /// A.22 — Handling application-limited sending during PROBE_REFILL.
+    /// equivalent to BBRUpdateMaxBw <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.5.5>
+    ///
+    /// The `!is_app_limited` half of the `update_max_bw` guard
+    /// (`delivery_rate >= BBR.max_bw || !RS.is_app_limited`) in isolation: an
+    /// application-limited delivery-rate sample whose rate is *below* the standing
+    /// `max_bw` must NOT be folded into the max-bandwidth filter, so a pause in the
+    /// application during a probe cannot pull the bandwidth estimate down toward the
+    /// artificially low app-limited rate. (The complementary half — an app-limited
+    /// sample that is `>= max_bw` is still trusted to raise it — is not exercised
+    /// here; only the "ignore low app-limited samples" behavior is.)
+    ///
+    /// Same single-bottleneck simulator as A.5/A.6, run in two phases:
+    ///  1. Not application-limited, no loss, full-cwnd until the flow cycles
+    ///     STARTUP -> DRAIN -> PROBE_BW, which establishes `max_bw` at ~`BW` (set
+    ///     from the non-app-limited STARTUP delivery-rate samples).
+    ///  2. The moment PROBE_BW is entered the app is throttled to a small fixed
+    ///     window (`APP_WINDOW`, far below the ~1*BDP..2*BDP cwnd) and every sent
+    ///     packet is stamped app-limited, exactly as A.6. The pipe drains to
+    ///     `APP_WINDOW` during the PROBE_DOWN phase, so by the time the probe timer
+    ///     fires the cycle into PROBE_REFILL every in-flight sample is app-limited
+    ///     and its delivery rate (~`APP_WINDOW / RTT`) sits well below `max_bw`.
+    ///
+    /// Across that PROBE_REFILL round trip each ack carries an app-limited sample
+    /// with `RS.delivery_rate < BBR.max_bw`, so `update_max_bw`'s guard is false and
+    /// `max_bw` is left untouched — asserted both per-ack (the estimate does not move
+    /// across any blocked sample) and across the whole round (its value on entering
+    /// PROBE_UP equals its value on entering PROBE_REFILL). Note the max-bw filter's
+    /// cycle counter only advances on non-app-limited round-start samples
+    /// (`adapt_long_term_model`), so the established estimate cannot even age out
+    /// while the app stays limited.
+    ///
+    /// PROBE_REFILL then advances to PROBE_UP on its round boundary
+    /// (`update_probe_bw_cycle_phase`). At that edge the app un-pauses (full sending
+    /// resumes); a purely app-limited PROBE_UP would never plateau nor be
+    /// cwnd-limited (`maybe_go_down` could never fire), so resuming is what lets
+    /// probing proceed. Asserts the estimate survived (`max_bw` still ~`BW`, never
+    /// collapsed toward the app-limited rate) and the ProbeBW cycle keeps turning —
+    /// the flow leaves that PROBE_UP and re-enters a fresh one. (On this constant-RTT,
+    /// infinite-buffer link PROBE_UP is exited by the periodic min-RTT probe rather
+    /// than a queue plateau, so the re-probe is the "still probing" signal.)
+    #[test]
+    fn probe_refill_ignores_app_limited_low_bw_samples() {
+        /// packet size in bytes
+        const MSS: u64 = 1200;
+        /// simulated bottleneck bandwidth: 100 Mbit/s in bytes/sec
+        const BW: f64 = 12_500_000.0;
+        /// simulated propagation round-trip time (100ms), matching A.5/A.6
+        const RTT_NS: u64 = 100_000_000;
+        const FWD_NS: u64 = RTT_NS / 2;
+        const RET_NS: u64 = RTT_NS / 2;
+        /// application window used once PROBE_BW is reached: bytes the app keeps
+        /// outstanding. Fixed and far below the PROBE_BW cwnd (~1000 packets here) so
+        /// the sender is application-limited (never cwnd-limited) and the resulting
+        /// delivery-rate samples (~`APP_WINDOW / RTT`) sit well below `max_bw`.
+        /// Matches A.6's window.
+        const APP_WINDOW: u64 = 200 * MSS;
+
+        // bottleneck serialization time for one MSS-sized packet
+        let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
+
+        // Drive the production default configuration.
+        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
+        assert_eq!(bbr.state, BbrState::Startup);
+
+        let base = Instant::now();
+        let at = |off_ns: u64| base + Duration::from_nanos(off_ns);
+        let mut rtt_est = RttEstimator::new(Duration::from_nanos(RTT_NS));
+
+        struct InFlight {
+            pn: u64,
+            send_ns: u64,
+            ack_ns: u64,
+        }
+        let mut flight: VecDeque<InFlight> = VecDeque::new();
+
+        let mut now_ns: u64 = 0;
+        let mut next_send_ns: u64 = 0;
+        // time at which the bottleneck finishes serving everything queued so far
+        let mut btl_free_ns: u64 = 0;
+        let mut inflight: u64 = 0;
+        let mut pn: u64 = 0;
+
+        // Phase 2 begins once PROBE_BW is entered: from then the app is limited to
+        // APP_WINDOW and every sent packet is stamped app-limited. Flipped back off at
+        // the PROBE_REFILL -> PROBE_UP edge so subsequent probing runs full-cwnd.
+        let mut app_limited_phase = false;
+
+        // max_bw sampled right as PROBE_REFILL is entered and right as it advances to
+        // PROBE_UP; equal iff the app-limited round left the estimate untouched.
+        let mut max_bw_at_refill_entry: Option<f64> = None;
+        let mut max_bw_at_up: Option<f64> = None;
+        // app-limited PROBE_REFILL samples whose delivery_rate < max_bw (the guard's
+        // target case), and the largest such rate seen (to show it really was below
+        // max_bw). Each of these acks is asserted inline to not move max_bw.
+        let mut blocked_samples: u64 = 0;
+        let mut max_app_limited_dr: f64 = 0.0;
+        // Whether the flow advanced PROBE_REFILL -> PROBE_UP, then (after full sending
+        // resumed) reached the plateau-driven PROBE_UP -> PROBE_DOWN exit.
+        let mut refill_to_up = false;
+        // Set once the flow leaves that first post-refill PROBE_UP, then again when it
+        // re-enters a fresh PROBE_UP — i.e. the ProbeBW cycle kept turning.
+        let mut left_post_refill_up = false;
+        let mut post_refill_reprobed = false;
+        let mut max_bw_final: f64 = 0.0;
+
+        for _ in 0..3_000_000 {
+            if post_refill_reprobed {
+                break;
+            }
+            let cwnd = bbr.window();
+            let window_cap = if app_limited_phase {
+                APP_WINDOW.min(cwnd)
+            } else {
+                cwnd
+            };
+            let can_send = inflight + MSS <= window_cap;
+            // In the full-cwnd phases a blocked send is a genuine cwnd limit; in the
+            // app-limited phase the small window is the binding limit, not cwnd, so it
+            // must not be reported as cwnd-limited.
+            if !app_limited_phase && !can_send {
+                bbr.on_cwnd_limited();
+            }
+            let next_ack = flight.front().map(|p| p.ack_ns);
+
+            let do_send = can_send && next_ack.is_none_or(|ack| next_send_ns <= ack);
+
+            if do_send {
+                now_ns = now_ns.max(next_send_ns);
+                let send_ns = now_ns;
+                // enqueue at the FIFO bottleneck, served at BW
+                let arrival = send_ns + FWD_NS;
+                let service_start = arrival.max(btl_free_ns);
+                let finish = service_start + btl_service_ns;
+                btl_free_ns = finish;
+                let ack_ns = finish + RET_NS;
+
+                bbr.on_packet_sent(at(send_ns), MSS as u16, pn);
+                inflight += MSS;
+                flight.push_back(InFlight {
+                    pn,
+                    send_ns,
+                    ack_ns,
+                });
+
+                if app_limited_phase {
+                    // Emulate the connection layer's C.app_limited (the index of the
+                    // last packet sent while the app had no more data) so the next
+                    // packet is stamped app-limited at send time. Same shape as A.2/A.6:
+                    // on_end_acks cannot keep samples app-limited on its own.
+                    bbr.app_limited = pn;
+                }
+
+                // pace the next send at BBR's chosen pacing rate
+                let pacing = bbr.pacing_rate.max(1.0);
+                next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                pn += 1;
+            } else if let Some(p) = flight.pop_front() {
+                now_ns = now_ns.max(p.ack_ns);
+                inflight -= MSS;
+                rtt_est.update(Duration::ZERO, Duration::from_nanos(now_ns - p.send_ns));
+
+                // update_max_bw runs inside on_ack, on the sample already pending from
+                // the previous on_end_acks. Snapshot max_bw and state around on_ack, and
+                // read that sample (bbr.rs) between on_ack and on_end_acks — that is
+                // exactly what update_max_bw's guard consumed.
+                let state_before = bbr.state;
+                let max_bw_before = bbr.max_bw;
+                bbr.on_ack(
+                    at(now_ns),
+                    at(p.send_ns),
+                    MSS,
+                    p.pn,
+                    app_limited_phase,
+                    &rtt_est,
+                );
+                let max_bw_after = bbr.max_bw;
+                let state_after = bbr.state;
+                let sample = bbr.rs;
+                bbr.on_end_acks(at(now_ns), inflight, app_limited_phase, Some(p.pn));
+
+                // Flip to the application-limited phase the moment PROBE_BW is entered,
+                // so the pipe drains to APP_WINDOW during PROBE_DOWN and the first
+                // PROBE_REFILL round is entirely app-limited. Same timing as A.6.
+                if !app_limited_phase && matches!(bbr.state, BbrState::ProbeBw(_)) {
+                    app_limited_phase = true;
+                }
+
+                // Capture max_bw as the first PROBE_REFILL is entered.
+                if state_after == BbrState::ProbeBw(ProbeBwSubstate::Refill)
+                    && max_bw_at_refill_entry.is_none()
+                {
+                    max_bw_at_refill_entry = Some(bbr.max_bw);
+                }
+
+                // Acks processed while already in PROBE_REFILL carry this round's
+                // samples. Every one is app-limited and low, so the guard must leave
+                // max_bw untouched.
+                if state_before == BbrState::ProbeBw(ProbeBwSubstate::Refill) {
+                    if let Some(rs) = sample
+                        && rs.is_app_limited
+                        && rs.delivery_rate > 0.0
+                        && rs.delivery_rate < max_bw_before
+                    {
+                        blocked_samples += 1;
+                        max_app_limited_dr = max_app_limited_dr.max(rs.delivery_rate);
+                        assert_eq!(
+                            max_bw_after, max_bw_before,
+                            "a low app-limited PROBE_REFILL sample \
+                             (delivery_rate {} < max_bw {max_bw_before}) must not update max_bw",
+                            rs.delivery_rate
+                        );
+                    }
+                    // PROBE_REFILL -> PROBE_UP fires on this round's boundary ack. Snapshot
+                    // max_bw and un-pause the app so subsequent probing runs full-cwnd.
+                    if state_after == BbrState::ProbeBw(ProbeBwSubstate::Up) && !refill_to_up {
+                        refill_to_up = true;
+                        max_bw_at_up = Some(bbr.max_bw);
+                        app_limited_phase = false;
+                    }
+                }
+
+                // Subsequent probing: with full sending resumed, the ProbeBW cycle must
+                // keep turning. Once the flow leaves the first post-refill PROBE_UP and
+                // then re-enters a fresh PROBE_UP, it is probing normally again. (This
+                // constant-RTT, infinite-buffer link exits PROBE_UP via the periodic
+                // min-RTT probe rather than a queue plateau, so the re-probe — not a
+                // PROBE_UP -> PROBE_DOWN edge — is the signal to check.)
+                if refill_to_up && state_after != BbrState::ProbeBw(ProbeBwSubstate::Up) {
+                    left_post_refill_up = true;
+                }
+                if left_post_refill_up && state_after == BbrState::ProbeBw(ProbeBwSubstate::Up) {
+                    post_refill_reprobed = true;
+                    max_bw_final = bbr.max_bw;
+                }
+            } else {
+                panic!("simulation stalled: window full but nothing in flight");
+            }
+        }
+
+        let max_bw_at_refill_entry =
+            max_bw_at_refill_entry.expect("flow never entered PROBE_REFILL");
+        let max_bw_at_up = max_bw_at_up.expect("PROBE_REFILL never advanced to PROBE_UP");
+
+        // Precondition: PROBE_REFILL was reached with max_bw established at ~BW by the
+        // non-app-limited STARTUP samples.
+        let entry_err = (max_bw_at_refill_entry - BW).abs() / BW;
+        assert!(
+            entry_err < 0.05,
+            "max_bw entering PROBE_REFILL ({max_bw_at_refill_entry}) should be within 5% of the \
+             simulated {BW} (rel err {entry_err})"
+        );
+
+        // The app-limited round produced the guard's target case: samples flagged
+        // app-limited with delivery_rate strictly below max_bw.
+        assert!(
+            blocked_samples > 0,
+            "expected app-limited PROBE_REFILL samples with delivery_rate < max_bw"
+        );
+        assert!(
+            max_app_limited_dr < max_bw_at_refill_entry,
+            "the app-limited PROBE_REFILL rate ({max_app_limited_dr}) should sit below max_bw \
+             ({max_bw_at_refill_entry})"
+        );
+
+        // Across the whole PROBE_REFILL round the artificially low app-limited samples
+        // left max_bw exactly unchanged (the guard rejected every one; the max-bw
+        // filter's cycle counter also never advanced on app-limited samples, so the
+        // estimate could not age out either).
+        assert_eq!(
+            max_bw_at_up, max_bw_at_refill_entry,
+            "max_bw must be unchanged across the app-limited PROBE_REFILL round \
+             (entry {max_bw_at_refill_entry}, PROBE_UP {max_bw_at_up})"
+        );
+
+        // Subsequent probing was handled correctly: PROBE_REFILL advanced to PROBE_UP
+        // and, once full sending resumed, the ProbeBW cycle kept turning — the flow
+        // left that PROBE_UP and re-entered a fresh one — with the bandwidth estimate
+        // intact (~BW, never collapsed to the app-limited rate).
+        assert!(
+            refill_to_up,
+            "PROBE_REFILL should advance to PROBE_UP after its round trip"
+        );
+        assert!(
+            post_refill_reprobed,
+            "flow should keep probing: re-enter PROBE_UP after the PROBE_REFILL round"
+        );
+        let final_err = (max_bw_final - BW).abs() / BW;
+        assert!(
+            final_err < 0.05,
+            "max_bw after subsequent probing ({max_bw_final}) should still be within 5% of the \
+             simulated {BW} (rel err {final_err})"
+        );
+    }
 }
