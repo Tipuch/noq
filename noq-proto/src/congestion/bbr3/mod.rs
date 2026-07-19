@@ -1777,6 +1777,12 @@ mod test {
     use std::cell::Cell;
     use std::ops::ControlFlow;
 
+    /// PROBE_UP undo snapshot taken before a (possibly spurious) loss:
+    /// (state, bw_shortterm, inflight_shortterm, inflight_longterm).
+    type UndoSnapshot = (BbrState, f64, u64, u64);
+    /// A loss episode: (pre-loss undo snapshot, post-loss state, post-loss inflight_longterm).
+    type LossEpisode = (UndoSnapshot, BbrState, u64);
+
     /// A packet in flight in the link simulator: its packet number and the
     /// simulator-nanosecond timestamps at which it was sent and will be acked.
     struct SimPacket {
@@ -1814,7 +1820,7 @@ mod test {
 
     impl Sim {
         fn new(config: Bbr3Config, mss: u64, bw: f64, rtt_ns: u64) -> Self {
-            Sim {
+            Self {
                 bbr: Bbr3::new(Arc::new(config), mss as u16),
                 base: Instant::now(),
                 rtt_est: RttEstimator::new(Duration::from_nanos(rtt_ns)),
@@ -2301,12 +2307,12 @@ mod test {
         const RTT_NS: u64 = 100_000_000;
         const FWD_NS: u64 = RTT_NS / 2;
         const RET_NS: u64 = RTT_NS / 2;
-        /// Fraction of the STARTUP bandwidth surviving into DRAIN. `max_bw` holds
-        /// its STARTUP peak through DRAIN, so DRAIN paces at 0.5 * BW. The draft's
-        /// 10% cut is too small here: at 0.9 * BW the link still outruns that
-        /// pacing and the queue drains (inflight-branch exit). The surviving link
-        /// must be below 0.5 * BW for the queue to persist, so use 0.4.
-        const DRAIN_BW_FACTOR: f64 = 0.4;
+        /// Fraction of STARTUP bandwidth surviving into DRAIN. `max_bw` holds its STARTUP
+        /// peak, so DRAIN paces at `DRAIN_PACING_GAIN * BW`; the surviving link must stay
+        /// below that for the queue to persist (the draft's 10% cut leaves the link
+        /// outrunning drain pacing). Derived from the constant (0.8x → 0.4 today) so it
+        /// tracks it.
+        const DRAIN_BW_FACTOR: f64 = 0.8 * DRAIN_PACING_GAIN;
 
         // Drive the production default configuration.
         let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
@@ -3092,13 +3098,13 @@ mod test {
             down_gain, PROBE_BW_DOWN_PACING_GAIN,
             "ProbeDownPacingGain should be 0.90"
         );
-        // A standing queue was present at entry: C.inflight exceeded at least one
-        // cruise threshold, so cruise could not fire immediately and a real drain
-        // had to happen.
+        // Standing queue at entry: C.inflight exceeded the binding cruise threshold
+        // BBRInflight(1.0), so cruise couldn't fire immediately. (Loss-free here, so
+        // inflight_longterm stays u64::MAX and BBRInflightWithHeadroom() never binds; cf. A.9.)
         assert!(
-            down_inflight > down_headroom || down_inflight > down_inflight_1,
+            down_inflight > down_inflight_1,
             "expected a standing queue at PROBE_DOWN entry (inflight {down_inflight} vs \
-             headroom {down_headroom}, inflight(1.0) {down_inflight_1})"
+             inflight(1.0) {down_inflight_1}; headroom {down_headroom} unbounded)"
         );
 
         // Drained into PROBE_CRUISE.
@@ -3114,18 +3120,13 @@ mod test {
             cruise_gain, bbr.default_pacing_gain,
             "PROBE_CRUISE pacing_gain should be DefaultPacingGain"
         );
-        // BBRIsTimeToCruise held: C.inflight fell to <= both thresholds. The queue
-        // only shrinks, so the value recomputed just after the edge still <= both,
-        // matching the (one-tick-larger) value that actually fired the transition.
-        assert!(
-            cruise_inflight <= cruise_headroom,
-            "at PROBE_CRUISE, inflight ({cruise_inflight}) should be <= \
-             BBRInflightWithHeadroom() ({cruise_headroom})"
-        );
+        // BBRIsTimeToCruise held: C.inflight fell to <= BBRInflight(1.0), the binding
+        // threshold. The queue only shrinks, so the post-edge recompute still holds.
+        // (Headroom is unbounded here — inflight_longterm == u64::MAX — so it never binds; cf. A.9.)
         assert!(
             cruise_inflight <= cruise_inflight_1,
-            "at PROBE_CRUISE, inflight ({cruise_inflight}) should be <= \
-             BBRInflight(1.0) ({cruise_inflight_1})"
+            "at PROBE_CRUISE, inflight ({cruise_inflight}) should be <= BBRInflight(1.0) \
+             ({cruise_inflight_1}); headroom {cruise_headroom} unbounded"
         );
     }
 
@@ -3172,8 +3173,10 @@ mod test {
         // Drive the production default configuration with a fixed probe RNG seed so
         // bw_probe_wait is deterministic; its exact value does not matter here since
         // the deadline is computed from it below.
-        let mut config = Bbr3Config::default();
-        config.probe_rng_seed = Some([6; 16]);
+        let config = Bbr3Config {
+            probe_rng_seed: Some([6; 16]),
+            ..Bbr3Config::default()
+        };
         let mut sim = Sim::new(config, MSS, BW, RTT_NS);
         assert_eq!(sim.bbr.state, BbrState::Startup);
 
@@ -3745,7 +3748,7 @@ mod test {
         const FWD_NS: u64 = RTT_NS / 2;
         const RET_NS: u64 = RTT_NS / 2;
         /// ACK-aggregation epoch. All packets whose bottleneck service finishes within the
-        /// same `AGG_NS` window have their ACKs released together. 5ms is ~52 MSS-times at
+        /// same `AGG_NS` window have their ACKs released together. 1ms is ~10 MSS-times at
         /// BW (bursty, cellular-like) yet well under the 100ms RTT, so bursts stay within a
         /// round trip.
         const AGG_NS: u64 = 1_000_000;
@@ -4162,9 +4165,10 @@ mod test {
             }
         }
 
-        // C.cwnd carried the full extra_acked headroom: BBRUpdateMaxInflight adds extra_acked
-        // on top of cwnd_gain*BDP (cwnd_gain being DefaultCwndGain = 2 in cruise), so cwnd sat
-        // at least max_extra_acked above 2*BDP at the peak.
+        // C.cwnd carried the extra_acked headroom: BBRUpdateMaxInflight adds extra_acked on top
+        // of cwnd_gain*BDP (=2*BDP in cruise). Both sides are peak maxima reduced independently
+        // over the sojourn (not necessarily the same round), so this asserts peak augmentation
+        // >= peak extra_acked — enough to catch dropping the `+ extra_acked` term.
         assert!(
             max_cwnd_augmentation >= max_extra_acked,
             "C.cwnd should sit >= max_extra_acked ({max_extra_acked}) above 2*BDP in cruise, \
@@ -4206,8 +4210,8 @@ mod test {
     /// stalling. This test drives that regime and asserts the floor governs `C.cwnd` while the
     /// pacing rate still tracks the low link bandwidth.
     ///
-    /// A single-bottleneck FIFO link at `BW` = 50 kB/s with a small propagation delay. Because
-    /// the bottleneck serialization of one MSS (`MSS/BW` = 24ms) dominates the measured
+    /// A single-bottleneck FIFO link at `BW` = 1 MB/s with a small propagation delay. Because
+    /// the bottleneck serialization of one MSS (`MSS/BW` = 1.2ms) dominates the measured
     /// min-RTT, the model's BDP estimate (`bw*min_rtt`) sits near a single packet — the
     /// propagation BDP (`bw*prop`) is well under one packet. Either way the cruise inflight
     /// budget `cwnd_gain*BDP` (cwnd_gain = DefaultCwndGain = 2) falls below `MinPipeCwnd`
@@ -4944,8 +4948,10 @@ mod test {
             adapt_cycles <= (MAX_BW_FILTER_LEN as u64) + 2,
             "expected max_bw to adapt within ~MAX_BW_FILTER_LEN PROBE_BW cycles, took {adapt_cycles}"
         );
+        // The break fired on max_bw <= 1.15*BW_LO, so only the lower bound informs here:
+        // confirm the estimate collapsed to (not below) the new rate.
         assert!(
-            bbr.max_bw >= 0.85 * BW_LO && bbr.max_bw <= 1.15 * BW_LO,
+            bbr.max_bw >= 0.85 * BW_LO,
             "max_bw should track the new path delivery rate BW_LO, got {}",
             bbr.max_bw
         );
@@ -5157,10 +5163,11 @@ mod test {
             "inflight_shortterm should become finite when the policer drops packets"
         );
 
-        // Stable operating point conforming to the token rate: goodput tracks TOKEN_RATE and the
-        // late-window loss rate is low (no excessive continuous loss).
+        // goodput tracks TOKEN_RATE, loss stays low. The lower bound is load-bearing (BBR
+        // keeps the pipe full); the upper bound is the policer's own cap, so it corroborates
+        // rather than tests BBR.
         assert!(
-            goodput >= 0.75 * TOKEN_RATE && goodput <= 1.25 * TOKEN_RATE,
+            (0.75 * TOKEN_RATE..=1.25 * TOKEN_RATE).contains(&goodput),
             "late-window goodput should track the token rate, got {goodput} ({:.2}x)",
             goodput / TOKEN_RATE
         );
@@ -5253,12 +5260,12 @@ mod test {
         let mut pn: u64 = 0;
         let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
 
-        // Pre-loss PROBE_UP snapshot (state, bw_shortterm, inflight_shortterm, inflight_longterm),
-        // taken the first time the flow is in PROBE_UP, before any reordering is introduced.
-        let mut pre: Option<(BbrState, f64, u64, u64)> = None;
+        // Pre-loss PROBE_UP snapshot, taken the first time the flow is in PROBE_UP,
+        // before any reordering is introduced.
+        let mut pre: Option<UndoSnapshot> = None;
         // Set once the reordering-induced loss has moved the flow off PROBE_UP; carries the
-        // (undo snapshot, post-loss state, post-loss inflight_longterm) for the assertions below.
-        let mut episode: Option<((BbrState, f64, u64, u64), BbrState, u64)> = None;
+        // undo snapshot + post-loss state/inflight_longterm for the assertions below.
+        let mut episode: Option<LossEpisode> = None;
 
         for _ in 0..5_000_000 {
             if episode.is_some() {
@@ -5517,12 +5524,12 @@ mod test {
         let mut pn: u64 = 0;
         let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
 
-        // Pre-loss PROBE_UP snapshot (state, bw_shortterm, inflight_shortterm, inflight_longterm),
-        // taken the first time the flow is in PROBE_UP, before the RTO is introduced.
-        let mut pre: Option<(BbrState, f64, u64, u64)> = None;
+        // Pre-loss PROBE_UP snapshot, taken the first time the flow is in PROBE_UP,
+        // before the RTO is introduced.
+        let mut pre: Option<UndoSnapshot> = None;
         // Set once the RTO-induced loss burst has moved the flow off PROBE_UP; carries the
-        // (undo snapshot, post-loss state, post-loss inflight_longterm) for the assertions below.
-        let mut episode: Option<((BbrState, f64, u64, u64), BbrState, u64)> = None;
+        // undo snapshot + post-loss state/inflight_longterm for the assertions below.
+        let mut episode: Option<LossEpisode> = None;
 
         for _ in 0..5_000_000 {
             if episode.is_some() {
@@ -5792,8 +5799,8 @@ mod test {
 
         // Captured on the targeted PROBE_RTT entry edge (first entry at or after
         // ProbeRTTInterval, i.e. the genuine interval-expiry interlude, not the t~0
-        // transient): (now_ns, cwnd_gain, round, full_bw_reached).
-        let mut entry: Option<(u64, f64, u64, bool)> = None;
+        // transient): (now_ns, cwnd_gain, full_bw_reached).
+        let mut entry: Option<(u64, f64, bool)> = None;
         // Captured when probe_rtt_done_stamp is first armed inside that interlude
         // (C.inflight has drained below the ProbeRTT cwnd cap): (now_ns, round).
         let mut done_armed: Option<(u64, u64)> = None;
@@ -5863,8 +5870,7 @@ mod test {
                         // Target only the interval-expiry interlude (>= ProbeRTTInterval),
                         // skipping the t~0 unset-stamp transient.
                         if entry.is_none() && now_ns >= PROBE_RTT_INTERVAL_SEC * 1_000_000_000 {
-                            entry =
-                                Some((now_ns, bbr.cwnd_gain, bbr.round_count, bbr.full_bw_reached));
+                            entry = Some((now_ns, bbr.cwnd_gain, bbr.full_bw_reached));
                         }
                         // The moment probe_rtt_done_stamp is armed inside that interlude:
                         // C.inflight has drained below the ProbeRTT cwnd cap.
@@ -5908,16 +5914,11 @@ mod test {
             "full_bw_reached must never be set on application-limited samples"
         );
 
-        // Entered PROBE_RTT, and only after ProbeRTTInterval (5 s) elapsed while
-        // still in STARTUP with full_bw_reached false.
-        let (entry_ns, entry_cwnd_gain, _entry_round, entry_full_bw) =
+        // Entered PROBE_RTT only after ProbeRTTInterval (5 s), still in STARTUP. `entry`
+        // is only set inside the `>= ProbeRTTInterval` guard above, so a successful
+        // `expect` already pins the interval-expiry timing.
+        let (entry_ns, entry_cwnd_gain, entry_full_bw) =
             entry.expect("BBR never entered the interval-expiry PROBE_RTT during STARTUP");
-        assert!(
-            entry_ns >= PROBE_RTT_INTERVAL_SEC * 1_000_000_000,
-            "PROBE_RTT entered before ProbeRTTInterval elapsed \
-             (entry {entry_ns} ns vs interval {}s)",
-            PROBE_RTT_INTERVAL_SEC
-        );
         assert!(
             !entry_full_bw,
             "full_bw_reached should be false on the STARTUP-phase PROBE_RTT entry"
@@ -6266,8 +6267,15 @@ mod test {
         // bottleneck serialization time for one MSS-sized packet
         let btl_service_ns: u64 = (MSS as f64 / BW * 1e9).round() as u64;
 
-        // Drive the production default configuration.
-        let mut bbr = Bbr3::new(Arc::new(Bbr3Config::default()), MSS as u16);
+        // Production default, but pin the probe RNG: once app-limiting lifts at the
+        // PROBE_REFILL -> PROBE_UP edge the flow does genuine PROBE_BW cycling, whose
+        // phase timing is RNG-driven, and default() seeds from entropy (cf. sibling
+        // probing tests).
+        let config = Bbr3Config {
+            probe_rng_seed: Some([6; 16]),
+            ..Bbr3Config::default()
+        };
+        let mut bbr = Bbr3::new(Arc::new(config), MSS as u16);
         assert_eq!(bbr.state, BbrState::Startup);
 
         let base = Instant::now();
@@ -6292,6 +6300,10 @@ mod test {
         // APP_WINDOW and every sent packet is stamped app-limited. Flipped back off at
         // the PROBE_REFILL -> PROBE_UP edge so subsequent probing runs full-cwnd.
         let mut app_limited_phase = false;
+        // One-shot latch: arm app-limiting exactly once, on first PROBE_BW entry.
+        // Otherwise the check below re-fires next ack (still PROBE_BW) and undoes the
+        // reset at the REFILL -> UP edge, trapping the flow app-limited forever.
+        let mut app_limited_armed = false;
 
         // max_bw sampled right as PROBE_REFILL is entered and right as it advances to
         // PROBE_UP; equal iff the app-limited round left the estimate untouched.
@@ -6389,7 +6401,8 @@ mod test {
                 // Flip to the application-limited phase the moment PROBE_BW is entered,
                 // so the pipe drains to APP_WINDOW during PROBE_DOWN and the first
                 // PROBE_REFILL round is entirely app-limited. Same timing as A.6.
-                if !app_limited_phase && matches!(bbr.state, BbrState::ProbeBw(_)) {
+                if !app_limited_armed && matches!(bbr.state, BbrState::ProbeBw(_)) {
+                    app_limited_armed = true;
                     app_limited_phase = true;
                 }
 
@@ -6492,10 +6505,14 @@ mod test {
             post_refill_reprobed,
             "flow should keep probing: re-enter PROBE_UP after the PROBE_REFILL round"
         );
+        // "Estimate intact" bar: genuine PROBE_BW cycling leaves max_bw a few % below the
+        // bottleneck (samples taken while pacing_gain < 1), so this guards against collapse
+        // to the app-limited rate (~0.19*BW), not tight tracking. 10% keeps ~4.7x margin;
+        // exact preservation across the app-limited round is asserted strictly above.
         let final_err = (max_bw_final - BW).abs() / BW;
         assert!(
-            final_err < 0.05,
-            "max_bw after subsequent probing ({max_bw_final}) should still be within 5% of the \
+            final_err < 0.10,
+            "max_bw after subsequent probing ({max_bw_final}) should still be within 10% of the \
              simulated {BW} (rel err {final_err})"
         );
     }
